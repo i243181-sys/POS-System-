@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SecureStore POS</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <section id="login" class="login">
+    <div class="login-panel">
+      <h1>SecureStore POS</h1>
+      <input id="username" placeholder="Username" autocomplete="username">
+      <input id="password" placeholder="Password" type="password" autocomplete="current-password">
+      <button onclick="login()">Sign in</button>
+      <p id="loginMessage" class="error"></p>
+    </div>
+  </section>
+
+  <main id="app" class="hidden">
+    <header>
+      <h1>SecureStore POS</h1>
+      <span id="currentUser"></span>
+    </header>
+    <nav>
+      <button onclick="showTab('dashboard')">Dashboard</button>
+      <button onclick="showTab('sales')">Sales</button>
+      <button onclick="showTab('productsView')">Products</button>
+      <button onclick="showTab('reportsView')">Reports</button>
+      <button onclick="showTab('usersView')">Users</button>
+      <button onclick="showTab('backupView')">Backup</button>
+    </nav>
+
+    <section id="dashboard" class="view cards">
+      <article><label>Today revenue</label><strong id="todayRevenue">$0.00</strong></article>
+      <article><label>Today sales</label><strong id="todayTransactions">0</strong></article>
+      <article><label>Total products</label><strong id="totalProducts">0</strong></article>
+      <article><label>Low stock</label><strong id="lowStockCount">0</strong></article>
+    </section>
+
+    <section id="sales" class="view hidden two-col">
+      <div>
+        <h2>Find Product</h2>
+        <input id="saleSearch" placeholder="Search product, brand, barcode" oninput="searchSale()">
+        <div id="suggestions" class="list"></div>
+        <div class="inline">
+          <input id="barcodeSale" placeholder="Barcode">
+          <button onclick="addBarcode()">Add barcode</button>
+        </div>
+      </div>
+      <div>
+        <h2>Cart</h2>
+        <div id="cart"></div>
+        <div class="payment">
+          <label>Discount % <input id="discountPercent" type="number" value="0" oninput="totals()"></label>
+          <label>Tax % <input id="taxPercent" type="number" value="0" oninput="totals()"></label>
+          <label>Paid <input id="paidAmount" type="number" value="0" oninput="totals()"></label>
+          <p>Subtotal: <strong id="subtotal">$0.00</strong></p>
+          <p>Net total: <strong id="netTotal">$0.00</strong></p>
+          <p>Change: <strong id="change">$0.00</strong></p>
+          <button class="primary" onclick="completeSale()">Complete sale</button>
+          <p id="saleMessage"></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="productsView" class="view hidden two-col">
+      <div>
+        <input id="productSearch" placeholder="Search products" oninput="loadProducts(this.value)">
+        <div id="products" class="list"></div>
+      </div>
+      <div class="form">
+        <h2>Product</h2>
+        <input id="productId" type="hidden">
+        <input id="productName" placeholder="Name">
+        <input id="barcode" placeholder="Barcode">
+        <input id="brand" placeholder="Brand">
+        <select id="categoryId"></select>
+        <input id="purchasePrice" type="number" placeholder="Purchase price">
+        <input id="sellingPrice" type="number" placeholder="Selling price">
+        <input id="stockQuantity" type="number" placeholder="Stock">
+        <input id="reorderLevel" type="number" placeholder="Reorder level">
+        <button onclick="saveProduct()">Save product</button>
+        <h3>Stock adjustment</h3>
+        <input id="adjustQuantity" type="number" placeholder="+10 or -3">
+        <input id="adjustReason" placeholder="Reason">
+        <button onclick="adjustStock()">Adjust stock</button>
+        <p id="productMessage"></p>
+        <h3>Backups</h3>
+        <div id="productBackups"></div>
+      </div>
+    </section>
+
+    <section id="reportsView" class="view hidden"><div id="reports"></div></section>
+    <section id="usersView" class="view hidden"><div id="users"></div></section>
+    <section id="backupView" class="view hidden"><button onclick="backup()">Create backup</button><p id="backupMessage"></p></section>
+  </main>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

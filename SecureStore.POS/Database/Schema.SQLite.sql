@@ -1,0 +1,182 @@
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+
+CREATE TABLE IF NOT EXISTS Roles (
+    RoleID INTEGER PRIMARY KEY AUTOINCREMENT,
+    RoleName TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS Users (
+    UserID INTEGER PRIMARY KEY AUTOINCREMENT,
+    Username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    PasswordHash TEXT NOT NULL,
+    FullName TEXT NOT NULL,
+    RoleID INTEGER NOT NULL,
+    Status INTEGER NOT NULL DEFAULT 1,
+    FailedLoginAttempts INTEGER NOT NULL DEFAULT 0,
+    LastLoginAt TEXT NULL,
+    LockedUntil TEXT NULL,
+    CreatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UpdatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(RoleID) REFERENCES Roles(RoleID)
+);
+CREATE INDEX IF NOT EXISTS IX_Users_RoleID ON Users(RoleID);
+
+CREATE TABLE IF NOT EXISTS Categories (
+    CategoryID INTEGER PRIMARY KEY AUTOINCREMENT,
+    CategoryName TEXT NOT NULL UNIQUE,
+    Description TEXT NULL,
+    IsActive INTEGER NOT NULL DEFAULT 1,
+    CreatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS Products (
+    ProductID INTEGER PRIMARY KEY AUTOINCREMENT,
+    ProductName TEXT NOT NULL,
+    Barcode TEXT NULL UNIQUE,
+    CategoryID INTEGER NOT NULL,
+    Brand TEXT NULL,
+    PurchasePrice NUMERIC NOT NULL DEFAULT 0 CHECK (PurchasePrice >= 0),
+    SellingPrice NUMERIC NOT NULL DEFAULT 0 CHECK (SellingPrice > 0),
+    StockQuantity INTEGER NOT NULL DEFAULT 0 CHECK (StockQuantity >= 0),
+    ReorderLevel INTEGER NOT NULL DEFAULT 10 CHECK (ReorderLevel >= 0),
+    IsActive INTEGER NOT NULL DEFAULT 1,
+    CreatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UpdatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(CategoryID) REFERENCES Categories(CategoryID)
+);
+CREATE INDEX IF NOT EXISTS IX_Products_ProductName ON Products(ProductName);
+CREATE INDEX IF NOT EXISTS IX_Products_Barcode ON Products(Barcode);
+CREATE INDEX IF NOT EXISTS IX_Products_CategoryID ON Products(CategoryID);
+CREATE INDEX IF NOT EXISTS IX_Products_IsActive ON Products(IsActive);
+
+CREATE TABLE IF NOT EXISTS Customers (
+    CustomerID INTEGER PRIMARY KEY AUTOINCREMENT,
+    AccountNumber TEXT NULL UNIQUE,
+    FullName TEXT NOT NULL,
+    FatherName TEXT NULL,
+    Phone TEXT NULL,
+    Email TEXT NULL,
+    Address TEXT NULL,
+    LoyaltyPoints NUMERIC NOT NULL DEFAULT 0,
+    IsActive INTEGER NOT NULL DEFAULT 1,
+    CreatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS Sales (
+    SaleID INTEGER PRIMARY KEY AUTOINCREMENT,
+    InvoiceNumber TEXT NOT NULL UNIQUE,
+    UserID INTEGER NOT NULL,
+    CustomerID INTEGER NULL,
+    SaleDate TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    SubTotal NUMERIC NOT NULL CHECK (SubTotal >= 0),
+    DiscountAmount NUMERIC NOT NULL CHECK (DiscountAmount >= 0),
+    DiscountPercent NUMERIC NOT NULL CHECK (DiscountPercent >= 0 AND DiscountPercent <= 100),
+    TaxAmount NUMERIC NOT NULL CHECK (TaxAmount >= 0),
+    NetTotal NUMERIC NOT NULL CHECK (NetTotal >= 0),
+    PaidAmount NUMERIC NOT NULL CHECK (PaidAmount >= 0),
+    ChangeAmount NUMERIC NOT NULL CHECK (ChangeAmount >= 0 AND ChangeAmount <= PaidAmount),
+    PaymentStatus INTEGER NOT NULL,
+    Notes TEXT NULL,
+    IsVoided INTEGER NOT NULL DEFAULT 0,
+    CreatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(UserID) REFERENCES Users(UserID),
+    FOREIGN KEY(CustomerID) REFERENCES Customers(CustomerID)
+);
+CREATE INDEX IF NOT EXISTS IX_Sales_SaleDate ON Sales(SaleDate);
+CREATE INDEX IF NOT EXISTS IX_Sales_UserID ON Sales(UserID);
+
+CREATE TABLE IF NOT EXISTS SaleItems (
+    SaleItemID INTEGER PRIMARY KEY AUTOINCREMENT,
+    SaleID INTEGER NOT NULL,
+    ProductID INTEGER NOT NULL,
+    ProductName TEXT NOT NULL,
+    Quantity INTEGER NOT NULL CHECK (Quantity > 0),
+    UnitPrice NUMERIC NOT NULL CHECK (UnitPrice > 0),
+    UnitCost NUMERIC NOT NULL DEFAULT 0 CHECK (UnitCost >= 0),
+    LineDiscount NUMERIC NOT NULL DEFAULT 0,
+    LineTotal NUMERIC NOT NULL CHECK (LineTotal >= 0),
+    FOREIGN KEY(SaleID) REFERENCES Sales(SaleID),
+    FOREIGN KEY(ProductID) REFERENCES Products(ProductID)
+);
+CREATE INDEX IF NOT EXISTS IX_SaleItems_SaleID ON SaleItems(SaleID);
+
+CREATE TABLE IF NOT EXISTS ProductBackups (
+    ProductBackupID INTEGER PRIMARY KEY AUTOINCREMENT,
+    ProductID INTEGER NULL,
+    Action TEXT NOT NULL,
+    DataPath TEXT NOT NULL,
+    ChecksumSha256 TEXT NULL,
+    CreatedByUserID INTEGER NULL,
+    CreatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(ProductID) REFERENCES Products(ProductID) ON DELETE SET NULL,
+    FOREIGN KEY(CreatedByUserID) REFERENCES Users(UserID) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS IX_ProductBackups_ProductID ON ProductBackups(ProductID);
+
+CREATE TABLE IF NOT EXISTS Payments (
+    PaymentID INTEGER PRIMARY KEY AUTOINCREMENT,
+    SaleID INTEGER NOT NULL,
+    PaymentMethod INTEGER NOT NULL,
+    Amount NUMERIC NOT NULL CHECK (Amount > 0),
+    PaymentDate TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ReferenceNo TEXT NULL,
+    Notes TEXT NULL,
+    FOREIGN KEY(SaleID) REFERENCES Sales(SaleID)
+);
+CREATE INDEX IF NOT EXISTS IX_Payments_SaleID ON Payments(SaleID);
+
+CREATE TABLE IF NOT EXISTS InventoryTransactions (
+    InventoryTransactionID INTEGER PRIMARY KEY AUTOINCREMENT,
+    ProductID INTEGER NOT NULL,
+    TransactionType INTEGER NOT NULL,
+    QuantityChange INTEGER NOT NULL,
+    OldStock INTEGER NOT NULL CHECK (OldStock >= 0),
+    NewStock INTEGER NOT NULL CHECK (NewStock >= 0),
+    UserID INTEGER NOT NULL,
+    Reason TEXT NOT NULL,
+    SaleID INTEGER NULL,
+    CreatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(ProductID) REFERENCES Products(ProductID),
+    FOREIGN KEY(UserID) REFERENCES Users(UserID),
+    FOREIGN KEY(SaleID) REFERENCES Sales(SaleID)
+);
+CREATE INDEX IF NOT EXISTS IX_InventoryTransactions_ProductID ON InventoryTransactions(ProductID);
+CREATE INDEX IF NOT EXISTS IX_InventoryTransactions_CreatedAt ON InventoryTransactions(CreatedAt);
+
+CREATE TABLE IF NOT EXISTS AuditLogs (
+    AuditLogID INTEGER PRIMARY KEY AUTOINCREMENT,
+    UserID INTEGER NULL,
+    Action TEXT NOT NULL,
+    EntityName TEXT NOT NULL,
+    EntityID TEXT NULL,
+    Description TEXT NOT NULL,
+    DeviceName TEXT NULL,
+    IpAddress TEXT NULL,
+    CreatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(UserID) REFERENCES Users(UserID)
+);
+CREATE INDEX IF NOT EXISTS IX_AuditLogs_CreatedAt ON AuditLogs(CreatedAt);
+CREATE INDEX IF NOT EXISTS IX_AuditLogs_UserID ON AuditLogs(UserID);
+CREATE INDEX IF NOT EXISTS IX_AuditLogs_Action ON AuditLogs(Action);
+
+CREATE TABLE IF NOT EXISTS Settings (
+    SettingID INTEGER PRIMARY KEY AUTOINCREMENT,
+    SettingKey TEXT NOT NULL UNIQUE,
+    SettingValue TEXT NOT NULL,
+    Description TEXT NULL,
+    UpdatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS BackupLogs (
+    BackupID INTEGER PRIMARY KEY AUTOINCREMENT,
+    BackupPath TEXT NOT NULL,
+    FileSizeBytes INTEGER NOT NULL DEFAULT 0,
+    BackupDate TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CreatedByUserID INTEGER NULL,
+    Status TEXT NOT NULL,
+    ErrorMessage TEXT NULL,
+    IsAutomatic INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(CreatedByUserID) REFERENCES Users(UserID)
+);
+CREATE INDEX IF NOT EXISTS IX_BackupLogs_BackupDate ON BackupLogs(BackupDate);

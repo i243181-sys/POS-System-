@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SecureStore POS
+Comment=Start SecureStore POS
+Exec=/home/mughees-haider/bin/securestore-pos-launcher
+Icon=securestore-pos
+Terminal=false
+Categories=Office;Finance;
+Keywords=POS;SecureStore;Point of Sale;Retail;Checkout;
+StartupNotify=true
+StartupWMClass=SecureStore POS
