@@ -26,3 +26,6 @@ data/
 *.db-shm
 *.restore-*.tmp
 *.replaced-*
+
+.test-build/
+artifacts/

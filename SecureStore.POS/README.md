@@ -1,3 +1,5 @@
+> Historical reference. The maintained Linux app and current instructions are documented in the [root README](../README.md). This document is not the current deployment or security specification.
+
 # SecureStore POS System
 
 SecureStore POS is a secure, crash-safe point-of-sale desktop app for small and medium shops. It now runs on Linux, Windows, and macOS through Avalonia UI while keeping the existing C# domain, repository, service, security, audit, and transaction layers.
