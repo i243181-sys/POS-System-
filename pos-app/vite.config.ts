@@ -40,7 +40,11 @@ export default defineConfig({
   },
   renderer: {
     root: resolve('.'),
-    plugins: [react()],
+    plugins: [react(), {
+      name: 'production-csp',
+      apply: 'build',
+      transformIndexHtml: (html: string) => html.replace(/connect-src[^;]+;/, "connect-src 'none';")
+    }],
     build: {
       rollupOptions: {
         input: resolve('index.html')

@@ -1,4 +1,5 @@
-import { getDb } from '../database/database'
+import { validDate, localDate } from '../../shared/dates'
+import { all, get } from '../database/database'
 import { logger } from '../utils/logger'
 import { publicErrorMessage } from '../utils/safeErrors'
 import type { DashboardData } from '../../shared/types'
@@ -16,9 +17,6 @@ function escapeHtml(value: unknown) {
     .replace(/'/g, '&#039;')
 }
 
-function validDate(value: string) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(value)
-}
 
 function reportFileName(startDate: string, endDate: string) {
   return `SecureStore_Sales_Report_${startDate}_to_${endDate}.pdf`
@@ -289,13 +287,12 @@ function buildSalesReportHtml(report: {
 }
 
 export const reportService = {
-  getDashboard: (): { success: boolean, data?: DashboardData, message: string } => {
+  getDashboard: async (): Promise<{ success: boolean, data?: DashboardData, message: string }> => {
     try {
-      const db = getDb()
       
-      const today = new Date().toISOString().slice(0, 10)
+      const today = localDate()
       
-      const salesRow = db.prepare(`
+      const salesRow = await get(`
         SELECT COUNT(*) as count,
                ROUND(IFNULL(SUM(PaidAmount - ChangeAmount), 0), 2) as collected,
                ROUND(IFNULL(SUM(NetTotal), 0), 2) as netSales,
@@ -304,27 +301,27 @@ export const reportService = {
                  ELSE 0
                END), 0), 2) as outstanding
         FROM Sales 
-        WHERE date(SaleDate) = ? AND IsVoided = 0
-      `).get(today) as any
+        WHERE date(SaleDate, 'localtime') = ? AND IsVoided = 0
+      `, [today]) as any
 
-      const prodRow = db.prepare(`SELECT COUNT(*) as cnt FROM Products WHERE IsActive = 1`).get() as any
-      const lowStockRow = db.prepare(`SELECT COUNT(*) as cnt FROM Products WHERE IsActive = 1 AND StockQuantity <= ReorderLevel`).get() as any
+      const prodRow = await get(`SELECT COUNT(*) as cnt FROM Products WHERE IsActive = 1`)
+      const lowStockRow = await get(`SELECT COUNT(*) as cnt FROM Products WHERE IsActive = 1 AND StockQuantity <= ReorderLevel`)
 
-      const recentSales = db.prepare(`
+      const recentSales = await all(`
         SELECT s.InvoiceNumber as invoiceNumber, u.FullName as cashierName, s.SaleDate as saleDate, s.NetTotal as netTotal
         FROM Sales s
         JOIN Users u ON s.UserID = u.UserID
         WHERE s.IsVoided = 0
         ORDER BY s.SaleDate DESC LIMIT 5
-      `).all() as any[]
+      `)
 
-      const lowStockItems = db.prepare(`
+      const lowStockItems = await all(`
         SELECT p.ProductName as productName, c.CategoryName as categoryName, p.StockQuantity as stockQuantity, p.ReorderLevel as reorderLevel
         FROM Products p
         LEFT JOIN Categories c ON p.CategoryID = c.CategoryID
         WHERE p.IsActive = 1 AND p.StockQuantity <= p.ReorderLevel
         ORDER BY p.StockQuantity ASC LIMIT 10
-      `).all() as any[]
+      `)
 
       return {
         success: true,
@@ -346,23 +343,22 @@ export const reportService = {
     }
   },
 
-  getDailyReport: (startDate: string, endDate: string) => {
+  getDailyReport: async (startDate: string, endDate: string) => {
     try {
-      const db = getDb()
       if (!validDate(startDate) || !validDate(endDate)) return { success: false, message: 'Choose a valid start and end date.', data: [] }
       if (startDate > endDate) return { success: false, message: 'Start date cannot be after end date.', data: [] }
-      const data = db.prepare(`
+      const data = await all(`
         WITH sale_costs AS (
           SELECT s.SaleID,
                  IFNULL(SUM(si.Quantity), 0) as itemsSold,
-                 IFNULL(SUM(si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0)), 0) as totalCost
+                 IFNULL(SUM(si.Quantity * COALESCE(si.UnitCost, 0)), 0) as totalCost
           FROM Sales s
           LEFT JOIN SaleItems si ON s.SaleID = si.SaleID
           LEFT JOIN Products p ON si.ProductID = p.ProductID
-          WHERE date(s.SaleDate) >= ? AND date(s.SaleDate) <= ? AND s.IsVoided = 0
+          WHERE date(s.SaleDate, 'localtime') >= ? AND date(s.SaleDate, 'localtime') <= ? AND s.IsVoided = 0
           GROUP BY s.SaleID
         )
-        SELECT date(s.SaleDate) as date,
+        SELECT date(s.SaleDate, 'localtime') as date,
                COUNT(*) as transactionCount,
                IFNULL(SUM(s.SubTotal), 0) as totalRevenue,
                IFNULL(SUM(s.DiscountAmount), 0) as totalDiscount,
@@ -378,38 +374,37 @@ export const reportService = {
                END as profitMargin
         FROM Sales s
         LEFT JOIN sale_costs sc ON s.SaleID = sc.SaleID
-        WHERE date(s.SaleDate) >= ? AND date(s.SaleDate) <= ? AND s.IsVoided = 0
-        GROUP BY date(s.SaleDate)
+        WHERE date(s.SaleDate, 'localtime') >= ? AND date(s.SaleDate, 'localtime') <= ? AND s.IsVoided = 0
+        GROUP BY date(s.SaleDate, 'localtime')
         ORDER BY date DESC
-      `).all(startDate, endDate, startDate, endDate)
+      `, [startDate, endDate, startDate, endDate])
       return { success: true, data, message: '' }
     } catch (error: any) {
       return { success: false, message: publicErrorMessage(error), data: [] }
     }
   },
 
-  getProductReport: (startDate: string, endDate: string) => {
+  getProductReport: async (startDate: string, endDate: string) => {
     try {
-      const db = getDb()
       if (!validDate(startDate) || !validDate(endDate)) return { success: false, message: 'Choose a valid start and end date.', data: [] }
       if (startDate > endDate) return { success: false, message: 'Start date cannot be after end date.', data: [] }
-      const data = db.prepare(`
+      const data = await all(`
         WITH product_lines AS (
           SELECT si.ProductID as productId,
                  si.ProductName as productName,
                  c.CategoryName as categoryName,
                  si.Quantity as quantity,
-                 si.LineTotal as grossRevenue,
+                 (si.Quantity * si.UnitPrice) as grossRevenue,
                  CASE
-                   WHEN s.SubTotal > 0 THEN (si.LineTotal / s.SubTotal) * s.DiscountAmount
+                   WHEN s.SubTotal > 0 THEN (si.Quantity * si.UnitPrice / s.SubTotal) * s.DiscountAmount
                    ELSE 0
                  END as allocatedDiscount,
-                 si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0) as totalCost
+                 si.Quantity * COALESCE(si.UnitCost, 0) as totalCost
           FROM SaleItems si
           JOIN Sales s ON si.SaleID = s.SaleID
           LEFT JOIN Products p ON si.ProductID = p.ProductID
           LEFT JOIN Categories c ON p.CategoryID = c.CategoryID
-          WHERE date(s.SaleDate) >= ? AND date(s.SaleDate) <= ? AND s.IsVoided = 0
+          WHERE date(s.SaleDate, 'localtime') >= ? AND date(s.SaleDate, 'localtime') <= ? AND s.IsVoided = 0
         )
         SELECT productId,
                productName,
@@ -428,26 +423,25 @@ export const reportService = {
         FROM product_lines
         GROUP BY productId, productName, categoryName
         ORDER BY totalRevenue DESC
-      `).all(startDate, endDate)
+      `, [startDate, endDate])
       return { success: true, data, message: '' }
     } catch (error: any) {
       return { success: false, message: publicErrorMessage(error), data: [] }
     }
   },
 
-  getCashierReport: (startDate: string, endDate: string) => {
+  getCashierReport: async (startDate: string, endDate: string) => {
     try {
-      const db = getDb()
       if (!validDate(startDate) || !validDate(endDate)) return { success: false, message: 'Choose a valid start and end date.', data: [] }
       if (startDate > endDate) return { success: false, message: 'Start date cannot be after end date.', data: [] }
-      const data = db.prepare(`
+      const data = await all(`
         WITH sale_costs AS (
           SELECT s.SaleID,
-                 IFNULL(SUM(si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0)), 0) as totalCost
+                 IFNULL(SUM(si.Quantity * COALESCE(si.UnitCost, 0)), 0) as totalCost
           FROM Sales s
           LEFT JOIN SaleItems si ON s.SaleID = si.SaleID
           LEFT JOIN Products p ON si.ProductID = p.ProductID
-          WHERE date(s.SaleDate) >= ? AND date(s.SaleDate) <= ? AND s.IsVoided = 0
+          WHERE date(s.SaleDate, 'localtime') >= ? AND date(s.SaleDate, 'localtime') <= ? AND s.IsVoided = 0
           GROUP BY s.SaleID
         )
         SELECT u.UserID as userId, u.FullName as cashierName,
@@ -464,10 +458,10 @@ export const reportService = {
         FROM Sales s
         JOIN Users u ON s.UserID = u.UserID
         LEFT JOIN sale_costs sc ON s.SaleID = sc.SaleID
-        WHERE date(s.SaleDate) >= ? AND date(s.SaleDate) <= ? AND s.IsVoided = 0
+        WHERE date(s.SaleDate, 'localtime') >= ? AND date(s.SaleDate, 'localtime') <= ? AND s.IsVoided = 0
         GROUP BY u.UserID, u.FullName
         ORDER BY totalRevenue DESC
-      `).all(startDate, endDate, startDate, endDate)
+      `, [startDate, endDate, startDate, endDate])
       return { success: true, data, message: '' }
     } catch (error: any) {
       return { success: false, message: publicErrorMessage(error), data: [] }
@@ -476,14 +470,13 @@ export const reportService = {
 
   exportDataExcel: async (parentWindow?: BrowserWindow | null) => {
     try {
-      const db = getDb()
       const generatedAt = new Date().toLocaleString()
 
-      const salesSummary = db.prepare(`
+      const salesSummary = await get(`
         WITH sale_costs AS (
           SELECT s.SaleID,
                  IFNULL(SUM(si.Quantity), 0) as itemsSold,
-                 IFNULL(SUM(si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0)), 0) as totalCost
+                 IFNULL(SUM(si.Quantity * COALESCE(si.UnitCost, 0)), 0) as totalCost
           FROM Sales s
           LEFT JOIN SaleItems si ON s.SaleID = si.SaleID
           LEFT JOIN Products p ON si.ProductID = p.ProductID
@@ -506,23 +499,23 @@ export const reportService = {
         FROM Sales s
         LEFT JOIN sale_costs sc ON s.SaleID = sc.SaleID
         WHERE s.IsVoided = 0
-      `).get() as Record<string, unknown>
+      `)
 
-      const counts = db.prepare(`
+      const counts = await get(`
         SELECT
           (SELECT COUNT(*) FROM Products) as productCount,
           (SELECT COUNT(*) FROM Products WHERE IsActive = 1) as activeProductCount,
           (SELECT COUNT(*) FROM Customers) as customerCount,
           (SELECT COUNT(*) FROM Sales WHERE IsVoided = 0) as saleCount,
           (SELECT COUNT(*) FROM Sales WHERE IsVoided = 1) as voidedSaleCount
-      `).get() as Record<string, unknown>
+      `)
 
-      const inventoryValue = db.prepare(`
+      const inventoryValue = await get(`
         SELECT ROUND(IFNULL(SUM(PurchasePrice * StockQuantity), 0), 2) as stockCost,
                ROUND(IFNULL(SUM(SellingPrice * StockQuantity), 0), 2) as stockRetailValue,
                ROUND(IFNULL(SUM((SellingPrice - PurchasePrice) * StockQuantity), 0), 2) as stockProfitPotential
         FROM Products
-      `).get() as Record<string, unknown>
+      `)
 
       const summaryRows = [
         { metric: 'Generated At', value: generatedAt },
@@ -545,18 +538,18 @@ export const reportService = {
         { metric: 'Stock Profit Potential', value: inventoryValue.stockProfitPotential }
       ]
 
-      const dailySales = db.prepare(`
+      const dailySales = await all(`
         WITH sale_costs AS (
           SELECT s.SaleID,
                  IFNULL(SUM(si.Quantity), 0) as itemsSold,
-                 IFNULL(SUM(si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0)), 0) as totalCost
+                 IFNULL(SUM(si.Quantity * COALESCE(si.UnitCost, 0)), 0) as totalCost
           FROM Sales s
           LEFT JOIN SaleItems si ON s.SaleID = si.SaleID
           LEFT JOIN Products p ON si.ProductID = p.ProductID
           WHERE s.IsVoided = 0
           GROUP BY s.SaleID
         )
-        SELECT date(s.SaleDate) as date,
+        SELECT date(s.SaleDate, 'localtime') as date,
                COUNT(*) as transactionCount,
                IFNULL(SUM(s.SubTotal), 0) as totalRevenue,
                IFNULL(SUM(s.DiscountAmount), 0) as totalDiscount,
@@ -568,16 +561,16 @@ export const reportService = {
         FROM Sales s
         LEFT JOIN sale_costs sc ON s.SaleID = sc.SaleID
         WHERE s.IsVoided = 0
-        GROUP BY date(s.SaleDate)
+        GROUP BY date(s.SaleDate, 'localtime')
         ORDER BY date DESC
-      `).all() as Array<Record<string, unknown>>
+      `)
 
-      const salesDetail = db.prepare(`
+      const salesDetail = await all(`
         WITH item_totals AS (
           SELECT si.SaleID,
                  COUNT(si.SaleItemID) as itemCount,
                  IFNULL(SUM(si.Quantity), 0) as itemsSold,
-                 ROUND(IFNULL(SUM(si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0)), 0), 2) as totalCost,
+                 ROUND(IFNULL(SUM(si.Quantity * COALESCE(si.UnitCost, 0)), 0), 2) as totalCost,
                  GROUP_CONCAT(si.ProductName || ' x' || si.Quantity, ', ') as itemSummary
           FROM SaleItems si
           LEFT JOIN Products p ON si.ProductID = p.ProductID
@@ -611,9 +604,9 @@ export const reportService = {
         LEFT JOIN Customers c ON s.CustomerID = c.CustomerID
         LEFT JOIN item_totals it ON s.SaleID = it.SaleID
         ORDER BY s.SaleDate DESC
-      `).all() as Array<Record<string, unknown>>
+      `)
 
-      const saleItems = db.prepare(`
+      const saleItems = await all(`
         SELECT s.InvoiceNumber as invoiceNumber,
                s.SaleDate as saleDate,
                si.ProductName as productName,
@@ -626,20 +619,20 @@ export const reportService = {
         FROM SaleItems si
         JOIN Sales s ON si.SaleID = s.SaleID
         ORDER BY s.SaleDate DESC, si.SaleItemID ASC
-      `).all() as Array<Record<string, unknown>>
+      `)
 
-      const productProfit = db.prepare(`
+      const productProfit = await all(`
         WITH product_lines AS (
           SELECT si.ProductID as productId,
                  si.ProductName as productName,
                  c.CategoryName as categoryName,
                  si.Quantity as quantity,
-                 si.LineTotal as grossRevenue,
+                 (si.Quantity * si.UnitPrice) as grossRevenue,
                  CASE
-                   WHEN s.SubTotal > 0 THEN (si.LineTotal / s.SubTotal) * s.DiscountAmount
+                   WHEN s.SubTotal > 0 THEN (si.Quantity * si.UnitPrice / s.SubTotal) * s.DiscountAmount
                    ELSE 0
                  END as allocatedDiscount,
-                 si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0) as totalCost
+                 si.Quantity * COALESCE(si.UnitCost, 0) as totalCost
           FROM SaleItems si
           JOIN Sales s ON si.SaleID = s.SaleID
           LEFT JOIN Products p ON si.ProductID = p.ProductID
@@ -658,9 +651,9 @@ export const reportService = {
         FROM product_lines
         GROUP BY productId, productName, categoryName
         ORDER BY totalRevenue DESC
-      `).all() as Array<Record<string, unknown>>
+      `)
 
-      const inventory = db.prepare(`
+      const inventory = await all(`
         SELECT p.ProductID as productId,
                p.ProductName as productName,
                p.Barcode as barcode,
@@ -679,9 +672,9 @@ export const reportService = {
         FROM Products p
         LEFT JOIN Categories c ON p.CategoryID = c.CategoryID
         ORDER BY p.IsActive DESC, p.ProductName ASC
-      `).all() as Array<Record<string, unknown>>
+      `)
 
-      const customers = db.prepare(`
+      const customers = await all(`
         SELECT c.AccountNumber as accountNumber,
                c.FullName as fullName,
                c.FatherName as fatherName,
@@ -701,9 +694,9 @@ export const reportService = {
         LEFT JOIN Sales s ON c.CustomerID = s.CustomerID AND s.IsVoided = 0
         GROUP BY c.CustomerID
         ORDER BY amountToBePaid DESC, c.FullName ASC
-      `).all() as Array<Record<string, unknown>>
+      `)
 
-      const payments = db.prepare(`
+      const payments = await all(`
         SELECT p.PaymentDate as paymentDate,
                s.InvoiceNumber as invoiceNumber,
                c.FullName as customerName,
@@ -715,9 +708,9 @@ export const reportService = {
         JOIN Sales s ON p.SaleID = s.SaleID
         LEFT JOIN Customers c ON s.CustomerID = c.CustomerID
         ORDER BY p.PaymentDate DESC
-      `).all() as Array<Record<string, unknown>>
+      `)
 
-      const stockHistory = db.prepare(`
+      const stockHistory = await all(`
         SELECT it.CreatedAt as createdAt,
                p.ProductName as productName,
                it.TransactionType as transactionType,
@@ -732,9 +725,9 @@ export const reportService = {
         JOIN Users u ON it.UserID = u.UserID
         LEFT JOIN Sales s ON it.SaleID = s.SaleID
         ORDER BY it.CreatedAt DESC
-      `).all() as Array<Record<string, unknown>>
+      `)
 
-      const backupLogs = db.prepare(`
+      const backupLogs = await all(`
         SELECT b.BackupDate as backupDate,
                b.BackupPath as backupPath,
                b.FileSizeBytes as fileSizeBytes,
@@ -747,7 +740,7 @@ export const reportService = {
         FROM BackupLogs b
         LEFT JOIN Users u ON b.CreatedByUserID = u.UserID
         ORDER BY b.BackupDate DESC
-      `).all() as Array<Record<string, unknown>>
+      `)
 
       const sheets: ExcelSheet[] = [
         {
@@ -952,20 +945,19 @@ export const reportService = {
         return { success: false, message: 'Start date cannot be after end date.' }
       }
 
-      const db = getDb()
-      const settingsRows = db.prepare('SELECT SettingKey, SettingValue FROM Settings').all() as any[]
+      const settingsRows = await all('SELECT SettingKey, SettingValue FROM Settings')
       const settings: Record<string, string> = {}
       for (const row of settingsRows) settings[row.SettingKey] = row.SettingValue
 
-      const summary = db.prepare(`
+      const summary = await get(`
         WITH sale_costs AS (
           SELECT s.SaleID,
                  IFNULL(SUM(si.Quantity), 0) as itemsSold,
-                 IFNULL(SUM(si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0)), 0) as totalCost
+                 IFNULL(SUM(si.Quantity * COALESCE(si.UnitCost, 0)), 0) as totalCost
           FROM Sales s
           LEFT JOIN SaleItems si ON s.SaleID = si.SaleID
           LEFT JOIN Products p ON si.ProductID = p.ProductID
-          WHERE date(s.SaleDate) >= ? AND date(s.SaleDate) <= ? AND s.IsVoided = 0
+          WHERE date(s.SaleDate, 'localtime') >= ? AND date(s.SaleDate, 'localtime') <= ? AND s.IsVoided = 0
           GROUP BY s.SaleID
         )
         SELECT COUNT(*) as transactionCount,
@@ -984,13 +976,13 @@ export const reportService = {
                ROUND(IFNULL(SUM((SubTotal - DiscountAmount) - IFNULL(sc.totalCost, 0)), 0), 2) as grossProfit
         FROM Sales s
         LEFT JOIN sale_costs sc ON s.SaleID = sc.SaleID
-        WHERE date(SaleDate) >= ? AND date(SaleDate) <= ? AND IsVoided = 0
-      `).get(startDate, endDate, startDate, endDate) as any
+        WHERE date(SaleDate, 'localtime') >= ? AND date(SaleDate, 'localtime') <= ? AND IsVoided = 0
+      `, [startDate, endDate, startDate, endDate]) as any
 
-      const daily = reportService.getDailyReport(startDate, endDate).data as any[]
-      const products = reportService.getProductReport(startDate, endDate).data as any[]
-      const cashiers = reportService.getCashierReport(startDate, endDate).data as any[]
-      const payments = db.prepare(`
+      const daily = (await reportService.getDailyReport(startDate, endDate)).data as any[]
+      const products = (await reportService.getProductReport(startDate, endDate)).data as any[]
+      const cashiers = (await reportService.getCashierReport(startDate, endDate)).data as any[]
+      const payments = await all(`
         SELECT PaymentMethod as paymentMethod,
                COUNT(*) as paymentCount,
                ROUND(IFNULL(SUM(CASE
@@ -999,16 +991,16 @@ export const reportService = {
                END), 0), 2) as totalAmount
         FROM Payments p
         JOIN Sales s ON p.SaleID = s.SaleID
-        WHERE date(s.SaleDate) >= ? AND date(s.SaleDate) <= ? AND s.IsVoided = 0
+        WHERE date(s.SaleDate, 'localtime') >= ? AND date(s.SaleDate, 'localtime') <= ? AND s.IsVoided = 0
         GROUP BY PaymentMethod
         ORDER BY totalAmount DESC
-      `).all(startDate, endDate) as any[]
-      const sales = db.prepare(`
+      `, [startDate, endDate]) as any[]
+      const sales = await all(`
         WITH item_totals AS (
           SELECT si.SaleID,
                  COUNT(si.SaleItemID) as itemCount,
                  IFNULL(SUM(si.Quantity), 0) as itemsSold,
-                 ROUND(IFNULL(SUM(si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0)), 0), 2) as totalCost,
+                 ROUND(IFNULL(SUM(si.Quantity * COALESCE(si.UnitCost, 0)), 0), 2) as totalCost,
                  GROUP_CONCAT(si.ProductName || ' x' || si.Quantity, ', ') as itemSummary
           FROM SaleItems si
           LEFT JOIN Products p ON si.ProductID = p.ProductID
@@ -1037,9 +1029,9 @@ export const reportService = {
         JOIN Users u ON s.UserID = u.UserID
         LEFT JOIN Customers c ON s.CustomerID = c.CustomerID
         LEFT JOIN item_totals it ON s.SaleID = it.SaleID
-        WHERE date(s.SaleDate) >= ? AND date(s.SaleDate) <= ? AND s.IsVoided = 0
+        WHERE date(s.SaleDate, 'localtime') >= ? AND date(s.SaleDate, 'localtime') <= ? AND s.IsVoided = 0
         ORDER BY s.SaleDate DESC
-      `).all(startDate, endDate) as any[]
+      `, [startDate, endDate]) as any[]
 
       const saveDialogOptions = {
         title: 'Save Sales Report PDF',

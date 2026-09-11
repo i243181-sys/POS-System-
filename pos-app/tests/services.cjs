@@ -1,0 +1,50 @@
+const assert = require('node:assert/strict')
+const Module = require('node:module')
+const originalLoad = Module._load
+Module._load = function(name, ...rest) {
+  if (name === 'electron') return { app: { isPackaged: true, getPath: () => require('node:os').tmpdir() } }
+  return originalLoad.call(this, name, ...rest)
+}
+const load = name => require(`../.test-build/electron/${name}`)
+const { initDb, closeDb, all, get } = load('database/database')
+const { runMigrations } = load('database/migrations')
+const { seedDatabase } = load('database/seeder')
+const { authService } = load('services/authService')
+const { productService } = load('services/productService')
+const { startSession, requireSession, endSession } = load('security/session')
+const { logger } = load('utils/logger')
+logger.silent = true
+
+async function main() {
+  initDb()
+  await runMigrations()
+  await seedDatabase()
+  const roles = await all('SELECT RoleName FROM Roles ORDER BY RoleName')
+  assert.deepEqual(roles.map(row => row.rolename), ['Admin', 'Cashier'])
+  const categories = await all('SELECT CategoryName FROM Categories WHERE IsActive = true ORDER BY CategoryName')
+  assert.ok(categories.length >= 10, 'seed categories are present')
+  const setup = await authService.getSetupStatus()
+  assert.equal(typeof setup.data.setupRequired, 'boolean')
+  const login = await authService.login({ username: 'admin', password: 'SecureStoreAdmin2026' })
+  assert.equal(login.success, true, `admin login failed: ${login.message}`)
+  startSession(login.user)
+  assert.equal((await requireSession()).userId, login.user.userId)
+    const { userService } = load('services/userService')
+    const rolesResponse = await userService.getAllRoles()
+    assert.deepEqual(rolesResponse.data.map(role => role.roleName), ['Admin', 'Cashier'])
+    const usersResponse = await userService.getAllUsers()
+    assert.equal(usersResponse.data.find(user => user.username === 'admin').roleName, 'Admin')
+  const products = await productService.getAll()
+  assert.equal(products.success, true, `authenticated product request failed: ${products.message}`)
+  assert.ok(Array.isArray(products.data))
+  const categoryResponse = await productService.getAllCategories()
+  assert.equal(categoryResponse.success, true)
+  assert.ok(categoryResponse.data.every(category => category.categoryId && category.categoryName))
+  endSession()
+  const counts = await get('SELECT (SELECT count(*) FROM Roles) AS roles, (SELECT count(*) FROM Categories) AS categories')
+  assert.ok(Number(counts.roles) >= 2)
+  assert.ok(Number(counts.categories) >= 10)
+  console.log(`PASS: PostgreSQL migrations, seed data, query adapter, and setup status (${categories.length} categories).`)
+}
+
+main().catch(error => { console.error(error); process.exitCode = 1 }).finally(async () => { await closeDb() })

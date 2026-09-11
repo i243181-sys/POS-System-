@@ -1,7 +1,7 @@
-import { getDb } from '../database/database'
+import { all, withTx, type Db } from '../database/database'
 import { auditService } from './auditService'
 import { logger } from '../utils/logger'
-import { publicErrorMessage } from '../utils/safeErrors'
+import { PublicError, publicErrorMessage } from '../utils/safeErrors'
 import type { ServiceResult } from '../../shared/types'
 
 const ALLOWED_SETTINGS = new Set([
@@ -34,37 +34,37 @@ function clean(settings: Record<string, string>) {
     next[key] = String(rawValue ?? '').trim()
   }
 
-  if (!next.ShopName) throw new Error('Shop name is required.')
-  if (!next.ShopAddress) throw new Error('Shop address is required.')
-  if (!next.ShopPhone) throw new Error('Shop phone is required.')
-  if (next.ShopName.length > 100) throw new Error('Shop name must be 100 characters or fewer.')
-  if (next.ShopAddress.length > 250) throw new Error('Shop address must be 250 characters or fewer.')
-  if (next.ShopPhone.length > 30) throw new Error('Shop phone must be 30 characters or fewer.')
-  if (next.ReceiptHeaderMessage && next.ReceiptHeaderMessage.length > 200) throw new Error('Receipt header must be 200 characters or fewer.')
-  if (next.ReceiptFooterMessage && next.ReceiptFooterMessage.length > 200) throw new Error('Receipt footer must be 200 characters or fewer.')
-  if (next.ShopEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(next.ShopEmail)) throw new Error('Shop email is not valid.')
+  if (!next.ShopName) throw new PublicError('Shop name is required.')
+  if (!next.ShopAddress) throw new PublicError('Shop address is required.')
+  if (!next.ShopPhone) throw new PublicError('Shop phone is required.')
+  if (next.ShopName.length > 100) throw new PublicError('Shop name must be 100 characters or fewer.')
+  if (next.ShopAddress.length > 250) throw new PublicError('Shop address must be 250 characters or fewer.')
+  if (next.ShopPhone.length > 30) throw new PublicError('Shop phone must be 30 characters or fewer.')
+  if (next.ReceiptHeaderMessage && next.ReceiptHeaderMessage.length > 200) throw new PublicError('Receipt header must be 200 characters or fewer.')
+  if (next.ReceiptFooterMessage && next.ReceiptFooterMessage.length > 200) throw new PublicError('Receipt footer must be 200 characters or fewer.')
+  if (next.ShopEmail && !/^\S+@\S+\.\S+$/.test(next.ShopEmail)) throw new PublicError('Shop email is not valid.')
 
   next.Currency = 'PKR'
   next.CurrencySymbol = 'Rs'
 
   const taxPercent = Number(next.TaxPercent || 0)
-  if (!Number.isFinite(taxPercent) || taxPercent < 0 || taxPercent > 100) throw new Error('Tax percent must be between 0 and 100.')
+  if (!Number.isFinite(taxPercent) || taxPercent < 0 || taxPercent > 100) throw new PublicError('Tax percent must be between 0 and 100.')
   next.TaxPercent = String(taxPercent)
 
   const sessionTimeout = Number(next.SessionTimeoutMinutes || 30)
-  if (!Number.isInteger(sessionTimeout) || sessionTimeout < 5 || sessionTimeout > 480) throw new Error('Session timeout must be between 5 and 480 minutes.')
+  if (!Number.isInteger(sessionTimeout) || sessionTimeout < 5 || sessionTimeout > 480) throw new PublicError('Session timeout must be between 5 and 480 minutes.')
   next.SessionTimeoutMinutes = String(sessionTimeout)
 
   const cashierDiscount = Number(next.CashierMaxDiscountPercent || 0)
-  if (!Number.isFinite(cashierDiscount) || cashierDiscount < 0 || cashierDiscount > 100) throw new Error('Cashier max discount must be between 0 and 100.')
+  if (!Number.isFinite(cashierDiscount) || cashierDiscount < 0 || cashierDiscount > 100) throw new PublicError('Cashier max discount must be between 0 and 100.')
   next.CashierMaxDiscountPercent = String(cashierDiscount)
 
   const lowStock = Number(next.LowStockThreshold || 10)
-  if (!Number.isInteger(lowStock) || lowStock < 0) throw new Error('Low stock threshold cannot be negative.')
+  if (!Number.isInteger(lowStock) || lowStock < 0) throw new PublicError('Low stock threshold cannot be negative.')
   next.LowStockThreshold = String(lowStock)
 
   const retentionDays = Number(next.MinimumDataRetentionDays || 365)
-  if (!Number.isInteger(retentionDays) || retentionDays < 365) throw new Error('Data retention must be at least 365 days.')
+  if (!Number.isInteger(retentionDays) || retentionDays < 365) throw new PublicError('Data retention must be at least 365 days.')
   next.MinimumDataRetentionDays = String(retentionDays)
 
   next.AutoBackupEnabled = String(next.AutoBackupEnabled === 'true')
@@ -73,7 +73,7 @@ function clean(settings: Record<string, string>) {
   next.BackupFolderPath = next.BackupFolderPath || 'Backups'
   const backupRetentionDays = Number(next.BackupRetentionDays || 30)
   if (!Number.isInteger(backupRetentionDays) || backupRetentionDays < 7 || backupRetentionDays > 3650) {
-    throw new Error('Backup retention must be between 7 and 3650 days.')
+    throw new PublicError('Backup retention must be between 7 and 3650 days.')
   }
   next.BackupRetentionDays = String(backupRetentionDays)
   next.InvoicePrefix = (next.InvoicePrefix || 'POS').replace(/[^A-Za-z0-9-]/g, '').slice(0, 12) || 'POS'
@@ -82,12 +82,9 @@ function clean(settings: Record<string, string>) {
 }
 
 export const settingsService = {
-  getAll: () => {
+  getAll: async () => {
     try {
-      const db = getDb()
-      const settings = db.prepare('SELECT SettingKey, SettingValue, Description FROM Settings').all()
-      
-      // Convert array of rows to a key-value dictionary object
+      const settings = await all('SELECT SettingKey, SettingValue, Description FROM Settings')
       const result: Record<string, string> = {}
       for (const row of settings as any[]) {
         result[row.SettingKey] = row.SettingValue
@@ -99,25 +96,22 @@ export const settingsService = {
     }
   },
 
-  updateAll: (settingsToUpdate: Record<string, string>, userId: number): ServiceResult => {
-    const db = getDb()
-    const transaction = db.transaction((settings: Record<string, string>) => {
-      const cleaned = clean(settings)
-      const stmt = db.prepare(`
-        INSERT INTO Settings (SettingKey, SettingValue, Description, UpdatedAt)
-        VALUES (?, ?, ?, datetime('now'))
-        ON CONFLICT(SettingKey) DO UPDATE SET
-          SettingValue = excluded.SettingValue,
-          UpdatedAt = datetime('now')
-      `)
-      for (const [key, value] of Object.entries(cleaned)) {
-        stmt.run(key, value, null)
-      }
-      auditService.log('SETTINGS_UPDATED', 'Settings', 'System settings were updated', userId)
-    })
-
+  updateAll: async (settingsToUpdate: Record<string, string>, userId: number): Promise<ServiceResult> => {
     try {
-      transaction(settingsToUpdate)
+      await withTx(async (tx: Db) => {
+        const cleaned = clean(settingsToUpdate)
+        for (const [key, value] of Object.entries(cleaned)) {
+          await tx.run(
+            `INSERT INTO Settings (SettingKey, SettingValue, Description, UpdatedAt)
+             VALUES ($1, $2, $3, now())
+             ON CONFLICT (SettingKey) DO UPDATE SET
+               SettingValue = excluded.SettingValue,
+               UpdatedAt = now()`,
+            [key, value, null]
+          )
+        }
+        await auditService.log('SETTINGS_UPDATED', 'Settings', 'System settings were updated', userId, undefined, tx)
+      })
       return { success: true, message: 'Settings saved successfully' }
     } catch (error: any) {
       logger.error('Failed to save settings', error)

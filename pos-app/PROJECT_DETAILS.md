@@ -1,3 +1,5 @@
+> Historical reference. The maintained Linux app and current instructions are documented in the [root README](../README.md). This document is not the current deployment or security specification.
+
 # SecureStore POS System - Full Project Details
 
 ## 1. Project Overview

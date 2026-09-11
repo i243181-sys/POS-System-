@@ -9,42 +9,41 @@
   "homepage": "https://securestore-pos.local",
   "main": "out/main/main.js",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "env -u ELECTRON_RUN_AS_NODE electron-vite dev",
     "build": "electron-vite build",
-    "start": "electron .",
-    "preview": "electron-vite preview",
+    "start": "env -u ELECTRON_RUN_AS_NODE electron .",
+    "preview": "env -u ELECTRON_RUN_AS_NODE electron-vite preview",
     "package": "electron-vite build && electron-builder",
     "postinstall": "electron-builder install-app-deps",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.node.json --noEmit",
-    "db:stress": "ELECTRON_RUN_AS_NODE=1 electron scripts/db-transaction-check.mjs"
+    "db:stress": "npm test",
+    "test": "tsc -p tsconfig.node.json --outDir .test-build && ELECTRON_RUN_AS_NODE=1 electron tests/services.cjs",
+    "test:ui": "npm run build && env -u ELECTRON_RUN_AS_NODE electron tests/ui-smoke.cjs",
+    "install:desktop": "node scripts/install-desktop.cjs"
   },
   "dependencies": {
-    "@types/three": "^0.184.1",
-    "autoprefixer": "^10.5.0",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^12.10.0",
-    "date-fns": "^3.6.0",
     "lucide-react": "^1.16.0",
-    "postcss": "^8.5.15",
+    "pg": "^8.23.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.30.4",
-    "recharts": "^2.12.7",
-    "tailwindcss": "^3.4.17",
-    "three": "^0.184.0",
-    "winston": "^3.13.0",
-    "zustand": "^4.5.2"
+    "winston": "^3.13.0"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
     "@types/better-sqlite3": "^7.6.10",
     "@types/node": "^20.14.0",
+    "@types/pg": "^8.23.1",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.0",
+    "autoprefixer": "^10.5.0",
     "electron": "^39.8.10",
     "electron-builder": "^26.8.1",
     "electron-vite": "^5.0.0",
+    "postcss": "^8.5.15",
+    "tailwindcss": "^3.4.17",
     "typescript": "^5.4.5",
     "vite": "^7.3.5"
   },
@@ -71,5 +70,8 @@
         "nsis"
       ]
     }
+  },
+  "engines": {
+    "node": ">=22.12.0 <25"
   }
 }

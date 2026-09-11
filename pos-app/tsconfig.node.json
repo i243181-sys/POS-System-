@@ -10,8 +10,15 @@
     "rootDir": ".",
     "resolveJsonModule": true,
     "paths": {
-      "@shared/*": ["./shared/*"]
-    }
+      "@shared/*": [
+        "./shared/*"
+      ]
+    },
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
   },
-  "include": ["electron", "shared"]
+  "include": [
+    "electron",
+    "shared"
+  ]
 }

@@ -1,9 +1,11 @@
-import { app, BrowserWindow, shell } from 'electron'
+import './config'
+import { app, BrowserWindow, dialog } from 'electron'
 import path from 'path'
 import { closeDb, initDb } from './database/database'
 import { runMigrations } from './database/migrations'
 import { registerIpcHandlers } from './ipc/handlers'
 import { logger } from './utils/logger'
+import { isAllowedRendererUrl } from './security/renderer'
 import { backupService } from './services/backupService'
 
 app.commandLine.appendSwitch('disable-dev-shm-usage')
@@ -23,33 +25,16 @@ app.on('second-instance', () => {
   mainWindow.focus()
 })
 
-function isAllowedRendererUrl(targetUrl: string) {
-  try {
-    const parsed = new URL(targetUrl)
-
-    if (process.env.ELECTRON_RENDERER_URL) {
-      const devUrl = new URL(process.env.ELECTRON_RENDERER_URL)
-      return parsed.origin === devUrl.origin
-    }
-
-    return parsed.protocol === 'file:'
-  } catch {
-    return false
-  }
-}
-
 async function bootstrap() {
   logger.info('Bootstrapping application...')
 
   // 1. Initialise Database
   const db = initDb()
-  runMigrations(db)
+  await runMigrations(db)
   await (await import('./database/seeder')).seedDatabase(db)
 
   // 2. Register IPC Handlers
-  registerIpcHandlers()
   backupService.startAutoBackupScheduler()
-  logger.info('IPC Handlers registered.')
 
   // 3. Create Browser Window
   mainWindow = new BrowserWindow({
@@ -69,20 +54,21 @@ async function bootstrap() {
   // Prevent title from changing to generic text
   mainWindow.setTitle('SecureStore POS')
 
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (/^https?:\/\//i.test(url)) {
-      shell.openExternal(url).catch((error) => logger.warn(`Could not open external URL: ${(error as Error).message}`))
-    }
+  registerIpcHandlers(mainWindow)
+  logger.info('IPC handlers registered.')
+  mainWindow.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
+  mainWindow.webContents.session.setPermissionCheckHandler(() => false)
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  mainWindow.webContents.on('will-attach-webview', event => event.preventDefault())
 
-    return { action: 'deny' }
-  })
-
-  mainWindow.webContents.on('will-navigate', (event, url) => {
+  const preventNavigation = (event: Electron.Event, url: string) => {
     if (!isAllowedRendererUrl(url)) {
       event.preventDefault()
-      logger.warn(`Blocked navigation away from SecureStore POS: ${url}`)
+      logger.warn('Blocked navigation away from SecureStore POS.')
     }
-  })
+  }
+  mainWindow.webContents.on('will-navigate', preventNavigation)
+  mainWindow.webContents.on('will-redirect', preventNavigation)
 
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show()
@@ -90,23 +76,29 @@ async function bootstrap() {
   })
 
   // Load the Vite dev server URL in development, or the local HTML in production
-  if (process.env.ELECTRON_RENDERER_URL) {
+  if (!app.isPackaged && process.env.ELECTRON_RENDERER_URL) {
     const rendererUrl = new URL(process.env.ELECTRON_RENDERER_URL)
-    if (!['localhost', '127.0.0.1', '::1'].includes(rendererUrl.hostname)) {
+    if (!isAllowedRendererUrl(rendererUrl.toString())) {
       throw new Error('Refusing to load a non-local renderer URL.')
     }
     logger.info(`Loading Dev URL: ${rendererUrl.origin}`)
-    mainWindow.loadURL(rendererUrl.toString())
+    await mainWindow.loadURL(rendererUrl.toString())
   } else {
     logger.info('Loading Production index.html')
-    mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
+    await mainWindow.loadFile(path.join(__dirname, '../renderer/index.html'))
+  }
+
+  if (!mainWindow.isVisible()) {
+    mainWindow.show()
+    logger.info('Main window shown after renderer load.')
   }
 }
 
 if (hasSingleInstanceLock) {
   app.whenReady().then(bootstrap).catch(err => {
     logger.error('Failed to bootstrap app', err)
-    app.quit()
+    dialog.showErrorBox('SecureStore POS could not start', 'Check the application Logs folder in your data directory. Verify configuration and file permissions, then try again.')
+    app.exit(1)
   })
 }
 
@@ -114,11 +106,17 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  if (backupService.isBusy()) {
+    event.preventDefault()
+    backupService.stopAutoBackupScheduler()
+    setTimeout(() => app.quit(), 100)
+    return
+  }
   backupService.stopAutoBackupScheduler()
   closeDb()
 })
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) bootstrap()
+  if (BrowserWindow.getAllWindows().length === 0) { app.relaunch(); app.exit(0) }
 })

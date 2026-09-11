@@ -1,19 +1,16 @@
-import { getDb } from '../database/database'
+import { validDate, localDate } from '../../shared/dates'
+import { all, get, withTx, type Db } from '../database/database'
 import { auditService } from './auditService'
 import { logger } from '../utils/logger'
-import { publicErrorMessage } from '../utils/safeErrors'
+import { PublicError, publicErrorMessage } from '../utils/safeErrors'
 import type { CompleteSaleRequest, PaymentStatus, SaleResult, ServiceResult } from '../../shared/types'
 
 function roundMoney(value: number) {
   return Math.round(Number(value) * 100) / 100
 }
 
-function validDate(value: string) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(value)
-}
-
-function settingNumber(db: ReturnType<typeof getDb>, key: string, fallback: number) {
-  const row = db.prepare('SELECT SettingValue FROM Settings WHERE SettingKey = ?').get(key) as any
+async function settingNumber(key: string, fallback: number) {
+  const row = await get('SELECT SettingValue FROM Settings WHERE SettingKey = $1', [key]) as any
   const value = Number(row?.SettingValue ?? fallback)
   return Number.isFinite(value) ? value : fallback
 }
@@ -44,239 +41,230 @@ function accountNumberForCustomer(customerId: number) {
 }
 
 export const saleService = {
-  completeSale: (req: CompleteSaleRequest): SaleResult => {
-    const db = getDb()
-    
-    const transaction = db.transaction((req: CompleteSaleRequest) => {
-      if (!Number.isInteger(req.userId) || req.userId <= 0) {
-        throw new Error('A valid cashier is required.')
-      }
-
-      const cashier = db.prepare(`
-        SELECT u.UserID, r.RoleName
-        FROM Users u
-        JOIN Roles r ON u.RoleID = r.RoleID
-        WHERE u.UserID = ? AND u.Status = 'Active' AND r.RoleName IN ('Admin', 'Cashier')
-      `).get(req.userId) as any
-      if (!cashier) throw new Error('Cashier account is not active or is not allowed to make sales.')
-
-      if (!Array.isArray(req.cartItems) || req.cartItems.length === 0) {
-        throw new Error('Add at least one product before completing a sale.')
-      }
-
-      const discountPercent = Number(req.discountPercent ?? 0)
-      const taxPercent = Number(req.taxPercent ?? 0)
-      const discountAmount = Number(req.discountAmount ?? 0)
-      if (!Number.isFinite(discountPercent) || discountPercent < 0 || discountPercent > 100) {
-        throw new Error('Discount percent must be between 0 and 100.')
-      }
-      if (!Number.isFinite(taxPercent) || taxPercent < 0 || taxPercent > 100) {
-        throw new Error('Tax percent must be between 0 and 100.')
-      }
-      if (!Number.isFinite(discountAmount) || discountAmount < 0) {
-        throw new Error('Discount amount cannot be negative.')
-      }
-
-      const getProductStmt = db.prepare(`
-        SELECT StockQuantity, ProductName, SellingPrice, PurchasePrice
-        FROM Products
-        WHERE ProductID = ? AND IsActive = 1
-      `)
-      const cartRows = req.cartItems.map((item) => {
-        if (!Number.isInteger(item.productId) || item.productId <= 0) throw new Error('Invalid product in cart.')
-        if (!Number.isInteger(item.quantity) || item.quantity <= 0) throw new Error(`Invalid quantity for ${item.productName}.`)
-        if (!Number.isFinite(item.lineDiscount) || item.lineDiscount < 0) throw new Error(`Invalid line discount for ${item.productName}.`)
-
-        const prod = getProductStmt.get(item.productId) as any
-        if (!prod) throw new Error(`Product ${item.productName} is inactive, deleted, or unavailable.`)
-        if (prod.StockQuantity < item.quantity) {
-          throw new Error(`Insufficient stock for ${prod.ProductName}. Available: ${prod.StockQuantity}`)
+  completeSale: async (req: CompleteSaleRequest): Promise<SaleResult> => {
+    try {
+      const result = await withTx(async (tx: Db) => {
+        if (!Number.isInteger(req.userId) || req.userId <= 0) {
+          throw new PublicError('A valid cashier is required.')
         }
 
-        const unitPrice = roundMoney(Number(prod.SellingPrice))
-        const unitCost = roundMoney(Number(prod.PurchasePrice || 0))
-        if (!Number.isFinite(unitPrice) || unitPrice <= 0) throw new Error(`Invalid price for ${prod.ProductName}.`)
-        if (!Number.isFinite(unitCost) || unitCost < 0) throw new Error(`Invalid purchase cost for ${prod.ProductName}.`)
-        const lineGross = roundMoney(unitPrice * item.quantity)
-        if (item.lineDiscount > lineGross) throw new Error(`Line discount is greater than line total for ${item.productName}.`)
-        return { item, prod, unitPrice, unitCost, lineTotal: roundMoney(lineGross - item.lineDiscount) }
-      })
-      const subTotal = roundMoney(cartRows.reduce((sum, row) => sum + roundMoney(row.unitPrice * row.item.quantity), 0))
-      const requestedDiscount = discountAmount > 0 ? discountAmount : (subTotal * discountPercent / 100)
-      const calculatedDiscount = roundMoney(Math.min(requestedDiscount, subTotal))
-      const effectiveDiscountPercent = subTotal > 0 ? roundMoney((calculatedDiscount / subTotal) * 100) : 0
-      const maxDiscount = cashier.RoleName === 'Admin'
-        ? settingNumber(db, 'AdminMaxDiscountPercent', 100)
-        : settingNumber(db, 'CashierMaxDiscountPercent', 5)
-      if (effectiveDiscountPercent > maxDiscount) {
-        throw new Error(`Applied discount exceeds the ${maxDiscount}% limit for this role.`)
-      }
-      const taxableAmount = roundMoney(subTotal - calculatedDiscount)
-      const calculatedTax = roundMoney(taxableAmount * (taxPercent / 100))
-      const netTotal = roundMoney(taxableAmount + calculatedTax)
-      const paidAmount = roundMoney(req.paidAmount)
-      const amountDue = roundMoney(Math.max(0, netTotal - paidAmount))
-      const changeAmount = roundMoney(Math.max(0, paidAmount - netTotal))
-      const collectedAmount = roundMoney(Math.max(0, paidAmount - changeAmount))
-      const paymentStatus: PaymentStatus = amountDue > 0 ? 'Pending' : 'Completed'
+        const cashier = await tx.get(`
+          SELECT u.UserID, r.RoleName
+          FROM Users u
+          JOIN Roles r ON u.RoleID = r.RoleID
+          WHERE u.UserID = $1 AND u.Status = 'Active' AND r.RoleName IN ('Admin', 'Cashier')
+        `, [req.userId]) as any
+        if (!cashier) throw new PublicError('Cashier account is not active or is not allowed to make sales.')
 
-      if (!Number.isFinite(paidAmount) || paidAmount < 0) {
-        throw new Error('Paid amount cannot be negative.')
-      }
-
-      const invoicePrefixSetting = db.prepare("SELECT SettingValue FROM Settings WHERE SettingKey = 'InvoicePrefix'").get() as any
-      const invoicePrefix = String(invoicePrefixSetting?.SettingValue || 'POS').replace(/[^A-Za-z0-9-]/g, '').slice(0, 12) || 'POS'
-      const datePart = new Date().toISOString().slice(0, 10).replace(/-/g, '')
-      const prefix = `${invoicePrefix}-${datePart}-`
-      const seqRow = db.prepare(`SELECT COUNT(*) as cnt FROM Sales WHERE InvoiceNumber LIKE ?`).get(`${prefix}%`) as any
-      const seq = (seqRow.cnt + 1).toString().padStart(6, '0')
-      const invoiceNumber = `${prefix}${seq}`
-      const customerName = req.customerName?.trim()
-      const customerFatherName = req.customerFatherName?.trim()
-      const customerPhone = normalizeMobile(req.customerPhone)
-      const customerEmail = req.customerEmail?.trim()
-      const requestedAccountNumber = amountDue > 0 ? normalizeAccountNumber(req.customerAccountNumber) : ''
-      let customerId = amountDue > 0 ? req.customerId || null : null
-      let customerAccountNumber: string | undefined
-
-      if (customerName && customerName.length > 100) throw new Error('Customer name must be 100 characters or fewer.')
-      if (customerFatherName && customerFatherName.length > 100) throw new Error('Father name must be 100 characters or fewer.')
-      if (customerPhone && customerPhone.length > 30) throw new Error('Customer phone must be 30 characters or fewer.')
-      if (customerEmail && (customerEmail.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail))) {
-        throw new Error('Customer email is not valid.')
-      }
-      if (amountDue > 0) {
-        if (!customerName) throw new Error('Customer name is required to open or use an account.')
-        if (!customerFatherName) throw new Error('Father name is required to open or use an account.')
-        if (!customerPhone || !isValidMobile(customerPhone)) throw new Error('A valid mobile number is required to open or use an account.')
-      }
-      if (String(req.paymentMethod) !== 'Cash') {
-        throw new Error('Only cash payments are accepted at checkout.')
-      }
-
-      if (amountDue > 0 && customerId) {
-        const customer = db.prepare('SELECT CustomerID, AccountNumber FROM Customers WHERE CustomerID = ? AND IsActive = 1').get(customerId) as any
-        if (!customer) throw new Error('Selected customer is inactive or does not exist.')
-        customerAccountNumber = customer.AccountNumber || accountNumberForCustomer(customerId)
-        if (!customer.AccountNumber) {
-          db.prepare('UPDATE Customers SET AccountNumber = ?, UpdatedAt = datetime(\'now\') WHERE CustomerID = ?').run(customerAccountNumber, customerId)
+        if (!Array.isArray(req.cartItems) || req.cartItems.length === 0) {
+          throw new PublicError('Add at least one product before completing a sale.')
         }
-      }
 
-      if (amountDue > 0 && !customerId && (requestedAccountNumber || customerPhone)) {
-        let existing: any = null
-        if (requestedAccountNumber) {
-          existing = db.prepare(`
-            SELECT CustomerID, AccountNumber, Phone FROM Customers
-            WHERE AccountNumber = ? AND IsActive = 1
-            LIMIT 1
-          `).get(requestedAccountNumber) as any
-          if (existing?.Phone && customerPhone && normalizeMobile(existing.Phone) !== customerPhone) {
-            throw new Error('Account ID and mobile number do not match the same customer.')
+        const discountPercent = Number(req.discountPercent ?? 0)
+        const taxPercent = Number(req.taxPercent ?? 0)
+        const discountAmount = Number(req.discountAmount ?? 0)
+        if (!Number.isFinite(discountPercent) || discountPercent < 0 || discountPercent > 100) {
+          throw new PublicError('Discount percent must be between 0 and 100.')
+        }
+        if (!Number.isFinite(taxPercent) || taxPercent < 0 || taxPercent > 100) {
+          throw new PublicError('Tax percent must be between 0 and 100.')
+        }
+        if (!Number.isFinite(discountAmount) || discountAmount < 0) {
+          throw new PublicError('Discount amount cannot be negative.')
+        }
+
+        if (req.cartItems.length > 1000) throw new PublicError('A sale can contain at most 1,000 products.')
+        const productIds = new Set<number>()
+        const cartRows: Array<{ item: any, prod: any, unitPrice: number, unitCost: number, lineTotal: number }> = []
+        for (const item of req.cartItems) {
+          if (productIds.has(item.productId)) throw new PublicError('Combine duplicate products into one cart line.')
+          productIds.add(item.productId)
+          if (!Number.isInteger(item.productId) || item.productId <= 0) throw new PublicError('Invalid product in cart.')
+          if (!Number.isSafeInteger(item.quantity) || item.quantity <= 0 || item.quantity > 100000) throw new PublicError(`Invalid quantity for ${item.productName}.`)
+          if (!Number.isFinite(item.lineDiscount) || item.lineDiscount < 0) throw new PublicError(`Invalid line discount for ${item.productName}.`)
+
+          const prod = await tx.get(
+            'SELECT StockQuantity, ProductName, SellingPrice, PurchasePrice FROM Products WHERE ProductID = $1 AND IsActive = true',
+            [item.productId]
+          ) as any
+          if (!prod) throw new PublicError(`Product ${item.productName} is inactive, deleted, or unavailable.`)
+          if (prod.StockQuantity < item.quantity) {
+            throw new PublicError(`Insufficient stock for ${prod.ProductName}. Available: ${prod.StockQuantity}`)
+          }
+
+          const unitPrice = roundMoney(Number(prod.SellingPrice))
+          const unitCost = roundMoney(Number(prod.PurchasePrice || 0))
+          if (!Number.isFinite(unitPrice) || unitPrice <= 0) throw new PublicError(`Invalid price for ${prod.ProductName}.`)
+          if (!Number.isFinite(unitCost) || unitCost < 0) throw new PublicError(`Invalid purchase cost for ${prod.ProductName}.`)
+          const lineGross = roundMoney(unitPrice * item.quantity)
+          if (item.lineDiscount > lineGross) throw new PublicError(`Line discount is greater than line total for ${item.productName}.`)
+          cartRows.push({ item, prod, unitPrice, unitCost, lineTotal: roundMoney(lineGross - item.lineDiscount) })
+        }
+        const subTotal = roundMoney(cartRows.reduce((sum, row) => sum + roundMoney(row.unitPrice * row.item.quantity), 0))
+        const requestedDiscount = discountAmount > 0 ? discountAmount : (subTotal * discountPercent / 100)
+        const lineDiscountTotal = roundMoney(cartRows.reduce((sum, row) => sum + row.item.lineDiscount, 0))
+        if (requestedDiscount + lineDiscountTotal > subTotal) throw new PublicError('Discounts cannot exceed the subtotal.')
+        const calculatedDiscount = roundMoney(requestedDiscount + lineDiscountTotal)
+        const effectiveDiscountPercent = subTotal > 0 ? roundMoney((calculatedDiscount / subTotal) * 100) : 0
+        const maxDiscount = cashier.RoleName === 'Admin'
+          ? await settingNumber('AdminMaxDiscountPercent', 100)
+          : await settingNumber('CashierMaxDiscountPercent', 5)
+        if (calculatedDiscount > roundMoney(subTotal * maxDiscount / 100)) {
+          throw new PublicError(`Applied discount exceeds the ${maxDiscount}% limit for this role.`)
+        }
+        const taxableAmount = roundMoney(subTotal - calculatedDiscount)
+        const calculatedTax = roundMoney(taxableAmount * (taxPercent / 100))
+        const netTotal = roundMoney(taxableAmount + calculatedTax)
+        const paidAmount = roundMoney(req.paidAmount)
+        const amountDue = roundMoney(Math.max(0, netTotal - paidAmount))
+        const changeAmount = roundMoney(Math.max(0, paidAmount - netTotal))
+        const collectedAmount = roundMoney(Math.max(0, paidAmount - changeAmount))
+        const paymentStatus: PaymentStatus = amountDue > 0 ? 'Pending' : 'Completed'
+
+        if (!Number.isFinite(paidAmount) || paidAmount < 0 || paidAmount > 1e12 || !Number.isSafeInteger(Math.round(netTotal * 100))) {
+          throw new PublicError('Paid amount cannot be negative.')
+        }
+
+        const invoicePrefixSetting = await tx.get("SELECT SettingValue FROM Settings WHERE SettingKey = 'InvoicePrefix'") as any
+        const invoicePrefix = String(invoicePrefixSetting?.SettingValue || 'POS').replace(/[^A-Za-z0-9-]/g, '').slice(0, 12) || 'POS'
+        const datePart = localDate().replace(/-/g, '')
+        const prefix = `${invoicePrefix}-${datePart}-`
+        const seqRow = await tx.get('SELECT COUNT(*) as cnt FROM Sales WHERE InvoiceNumber ILIKE $1', [`${prefix}%`]) as any
+        const seq = (Number(seqRow.cnt) + 1).toString().padStart(6, '0')
+        const invoiceNumber = `${prefix}${seq}`
+        const customerName = req.customerName?.trim()
+        const customerFatherName = req.customerFatherName?.trim()
+        const customerPhone = normalizeMobile(req.customerPhone)
+        const customerEmail = req.customerEmail?.trim()
+        const requestedAccountNumber = amountDue > 0 ? normalizeAccountNumber(req.customerAccountNumber) : ''
+        let customerId: number | null = amountDue > 0 ? req.customerId || null : null
+        let customerAccountNumber: string | undefined
+
+        if (customerName && customerName.length > 100) throw new PublicError('Customer name must be 100 characters or fewer.')
+        if (customerFatherName && customerFatherName.length > 100) throw new PublicError('Father name must be 100 characters or fewer.')
+        if (customerPhone && customerPhone.length > 30) throw new PublicError('Customer phone must be 30 characters or fewer.')
+        if (customerEmail && (customerEmail.length > 100 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail))) {
+          throw new PublicError('Customer email is not valid.')
+        }
+        if (amountDue > 0) {
+          if (!customerName) throw new PublicError('Customer name is required to open or use an account.')
+          if (!customerFatherName) throw new PublicError('Father name is required to open or use an account.')
+          if (!customerPhone || !isValidMobile(customerPhone)) throw new PublicError('A valid mobile number is required to open or use an account.')
+        }
+        if (String(req.paymentMethod) !== 'Cash') {
+          throw new PublicError('Only cash payments are accepted at checkout.')
+        }
+
+        if (amountDue > 0 && customerId) {
+          const customer = await tx.get('SELECT CustomerID, AccountNumber, Phone FROM Customers WHERE CustomerID = $1 AND IsActive = true', [customerId]) as any
+          if (!customer) throw new PublicError('Selected customer is inactive or does not exist.')
+          if (normalizeMobile(customer.Phone) !== customerPhone || (requestedAccountNumber && customer.AccountNumber !== requestedAccountNumber)) throw new PublicError('Account ID and mobile number do not match the same customer.')
+          customerAccountNumber = customer.AccountNumber || accountNumberForCustomer(customerId)
+          if (!customer.AccountNumber) {
+            await tx.run('UPDATE Customers SET AccountNumber = $1, UpdatedAt = now() WHERE CustomerID = $2', [customerAccountNumber, customerId])
           }
         }
 
-        if (!existing && customerPhone) {
-          existing = db.prepare(`
-            SELECT CustomerID, AccountNumber, Phone FROM Customers
-            WHERE Phone = ? AND IsActive = 1
-            ORDER BY CustomerID DESC
-            LIMIT 1
-          `).get(customerPhone) as any
+        if (amountDue > 0 && !customerId && (requestedAccountNumber || customerPhone)) {
+          let existing: any = null
+          if (requestedAccountNumber) {
+            existing = await tx.get(
+              `SELECT CustomerID, AccountNumber, Phone FROM Customers WHERE AccountNumber = $1 AND IsActive = true LIMIT 1`,
+              [requestedAccountNumber]
+            )
+            if (!existing) throw new PublicError('Account ID was not found. Leave it blank to open a new account.')
+            if (existing?.Phone && customerPhone && normalizeMobile(existing.Phone) !== customerPhone) {
+              throw new PublicError('Account ID and mobile number do not match the same customer.')
+            }
+          }
+
+          if (!existing && customerPhone) {
+            existing = await tx.get(`
+              SELECT CustomerID, AccountNumber, Phone FROM Customers
+              WHERE Phone = $1 AND IsActive = true
+              ORDER BY CustomerID DESC
+              LIMIT 1
+            `, [customerPhone])
+          }
+
+          if (existing) {
+            customerId = Number(existing.CustomerID)
+            customerAccountNumber = existing.AccountNumber || accountNumberForCustomer(customerId)
+            await tx.run(
+              `UPDATE Customers
+               SET FullName = COALESCE($1, FullName),
+                   FatherName = COALESCE($2, FatherName),
+                   Phone = COALESCE($3, Phone),
+                   Email = COALESCE($4, Email),
+                   AccountNumber = CASE
+                     WHEN AccountNumber IS NULL OR trim(AccountNumber) = '' THEN $5
+                     ELSE AccountNumber
+                   END,
+                   UpdatedAt = now()
+               WHERE CustomerID = $6`,
+              [customerName || null, customerFatherName || null, customerPhone || null, customerEmail || null, customerAccountNumber, customerId]
+            )
+          }
         }
 
-        if (existing) {
-          customerId = Number(existing.CustomerID)
-          customerAccountNumber = existing.AccountNumber || accountNumberForCustomer(customerId)
-          db.prepare(`
-            UPDATE Customers
-            SET FullName = COALESCE(?, FullName),
-                FatherName = COALESCE(?, FatherName),
-                Phone = COALESCE(?, Phone),
-                Email = COALESCE(?, Email),
-                AccountNumber = CASE
-                  WHEN AccountNumber IS NULL OR trim(AccountNumber) = '' THEN ?
-                  ELSE AccountNumber
-                END,
-                UpdatedAt = datetime('now')
-            WHERE CustomerID = ?
-          `).run(customerName || null, customerFatherName || null, customerPhone || null, customerEmail || null, customerAccountNumber, customerId)
+        if (!customerId && amountDue > 0) {
+          const customerInfo = await tx.run(
+            `INSERT INTO Customers (FullName, FatherName, Phone, Email, UpdatedAt)
+             VALUES ($1, $2, $3, $4, now()) RETURNING CustomerID`,
+            [customerName, customerFatherName, customerPhone, customerEmail || null]
+          )
+          customerId = Number(customerInfo.rows[0].CustomerID)
+          customerAccountNumber = accountNumberForCustomer(customerId)
+          await tx.run('UPDATE Customers SET AccountNumber = $1 WHERE CustomerID = $2', [customerAccountNumber, customerId])
         }
-      }
 
-      if (!customerId && amountDue > 0) {
-        const customerInfo = db.prepare(`
-          INSERT INTO Customers (FullName, FatherName, Phone, Email, UpdatedAt)
-          VALUES (?, ?, ?, ?, datetime('now'))
-        `).run(customerName, customerFatherName, customerPhone, customerEmail || null)
-        customerId = Number(customerInfo.lastInsertRowid)
-        customerAccountNumber = accountNumberForCustomer(customerId)
-        db.prepare(`
-          UPDATE Customers
-          SET AccountNumber = ?
-          WHERE CustomerID = ?
-        `).run(customerAccountNumber, customerId)
-      }
-
-      const insertSaleStmt = db.prepare(`
-        INSERT INTO Sales (InvoiceNumber, UserID, CustomerID, SubTotal, DiscountAmount, DiscountPercent, TaxAmount, NetTotal, PaidAmount, ChangeAmount, PaymentStatus, Notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      const saleInfo = insertSaleStmt.run(
-        invoiceNumber, req.userId, customerId, subTotal, calculatedDiscount, 
-        discountPercent, calculatedTax, netTotal, paidAmount, changeAmount, paymentStatus, req.notes || null
-      )
-      const saleId = Number(saleInfo.lastInsertRowid)
-
-      const insertItemStmt = db.prepare(`
-        INSERT INTO SaleItems (SaleID, ProductID, ProductName, Quantity, UnitPrice, UnitCost, LineDiscount, LineTotal)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      const updateStockStmt = db.prepare(`
-        UPDATE Products
-        SET StockQuantity = StockQuantity - ?, UpdatedAt = datetime('now')
-        WHERE ProductID = ? AND IsActive = 1 AND StockQuantity >= ?
-      `)
-      const insertInvStmt = db.prepare(`
-        INSERT INTO InventoryTransactions (ProductID, TransactionType, QuantityChange, OldStock, NewStock, UserID, Reason, SaleID)
-        VALUES (?, 'Sale', ?, ?, ?, ?, ?, ?)
-      `)
-
-      for (const { item, prod, unitPrice, unitCost, lineTotal } of cartRows) {
-        const itemName = prod.ProductName || item.productName
-        insertItemStmt.run(saleId, item.productId, itemName, item.quantity, unitPrice, unitCost, item.lineDiscount, lineTotal)
-        const stockUpdate = updateStockStmt.run(item.quantity, item.productId, item.quantity)
-        if (stockUpdate.changes !== 1) throw new Error(`${itemName} is no longer active or does not have enough stock.`)
-        
-        insertInvStmt.run(
-          item.productId, -item.quantity, prod.StockQuantity, prod.StockQuantity - item.quantity,
-          req.userId, `Sale ${invoiceNumber}`, saleId
+        const saleInfo = await tx.run(
+          `INSERT INTO Sales (InvoiceNumber, UserID, CustomerID, SubTotal, DiscountAmount, DiscountPercent, TaxAmount, NetTotal, PaidAmount, ChangeAmount, PaymentStatus, Notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING SaleID`,
+          [invoiceNumber, req.userId, customerId, subTotal, calculatedDiscount, effectiveDiscountPercent, calculatedTax, netTotal, paidAmount, changeAmount, paymentStatus, req.notes || null]
         )
-      }
+        const saleId = Number(saleInfo.rows[0].SaleID)
 
-      const insertPaymentStmt = db.prepare(`
-        INSERT INTO Payments (SaleID, PaymentMethod, Amount, ReferenceNo)
-        VALUES (?, ?, ?, ?)
-      `)
-      if (collectedAmount > 0) {
-        insertPaymentStmt.run(saleId, 'Cash', collectedAmount, req.paymentReference || null)
-      }
+        for (const { item, prod, unitPrice, unitCost, lineTotal } of cartRows) {
+          const itemName = prod.ProductName || item.productName
+          await tx.run(
+            `INSERT INTO SaleItems (SaleID, ProductID, ProductName, Quantity, UnitPrice, UnitCost, LineDiscount, LineTotal)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [saleId, item.productId, itemName, item.quantity, unitPrice, unitCost, item.lineDiscount, lineTotal]
+          )
+          const stockUpdate = await tx.run(
+            `UPDATE Products SET StockQuantity = StockQuantity - $1, UpdatedAt = now()
+             WHERE ProductID = $2 AND IsActive = true AND StockQuantity >= $1`,
+            [item.quantity, item.productId]
+          )
+          if (stockUpdate.rowCount !== 1) throw new PublicError(`${itemName} is no longer active or does not have enough stock.`)
 
-      const insertAuditStmt = db.prepare(`
-        INSERT INTO AuditLogs (UserID, Action, EntityName, EntityID, Description)
-        VALUES (?, 'SALE_COMPLETED', 'Sale', ?, ?)
-      `)
-      insertAuditStmt.run(
-        req.userId,
-        saleId,
-        `Sale ${invoiceNumber} ${paymentStatus === 'Pending' ? 'saved with unpaid balance' : 'completed'} for ${netTotal.toFixed(2)}${customerId ? ` for customer ${customerId}` : ''}${amountDue > 0 ? `, due ${amountDue.toFixed(2)}` : ''}.`
-      )
+          await tx.run(
+            `INSERT INTO InventoryTransactions (ProductID, TransactionType, QuantityChange, OldStock, NewStock, UserID, Reason, SaleID)
+             VALUES ($1, 'Sale', $2, $3, $4, $5, $6, $7)`,
+            [item.productId, -item.quantity, prod.StockQuantity, prod.StockQuantity - item.quantity, req.userId, `Sale ${invoiceNumber}`, saleId]
+          )
+        }
 
-      return { saleId, invoiceNumber, netTotal, changeAmount, amountDue, paymentStatus, customerId: customerId || undefined, customerAccountNumber }
-    })
+        if (collectedAmount > 0) {
+          await tx.run(
+            'INSERT INTO Payments (SaleID, PaymentMethod, Amount, ReferenceNo) VALUES ($1, $2, $3, $4)',
+            [saleId, 'Cash', collectedAmount, req.paymentReference || null]
+          )
+        }
 
-    try {
-      const result = transaction(req)
+        await tx.run(
+          `INSERT INTO AuditLogs (UserID, Action, EntityName, EntityID, Description) VALUES ($1, 'SALE_COMPLETED', 'Sale', $2, $3)`,
+          [
+            req.userId,
+            saleId,
+            `Sale ${invoiceNumber} ${paymentStatus === 'Pending' ? 'saved with unpaid balance' : 'completed'} for ${netTotal.toFixed(2)}${customerId ? ` for customer ${customerId}` : ''}${amountDue > 0 ? `, due ${amountDue.toFixed(2)}` : ''}.`
+          ]
+        )
+
+        return { saleId, invoiceNumber, netTotal, changeAmount, amountDue, paymentStatus, customerId: customerId || undefined, customerAccountNumber }
+      })
+
       logger.info(`Sale ${result.invoiceNumber} committed successfully.`)
       return {
         success: true,
@@ -289,37 +277,37 @@ export const saleService = {
     }
   },
 
-  getTodaySales: () => {
+  getTodaySales: async (userId?: number) => {
     try {
-      const db = getDb()
-      const today = new Date().toISOString().slice(0, 10)
-      const data = db.prepare(`
-        SELECT s.*, u.FullName as cashierName 
-        FROM Sales s 
-        JOIN Users u ON s.UserID = u.UserID
-        WHERE date(s.SaleDate) = ?
-        ORDER BY s.SaleDate DESC
-      `).all(today)
+      const today = localDate()
+      const data = await all(
+        `SELECT s.*, u.FullName as cashierName
+         FROM Sales s
+         JOIN Users u ON s.UserID = u.UserID
+         WHERE (s.SaleDate)::date = $1::date AND ($2::int IS NULL OR s.UserID = $2::int)
+         ORDER BY s.SaleDate DESC`,
+        [today, userId ?? null]
+      )
       return { success: true, data, message: '' }
     } catch (error: any) {
       return { success: false, message: publicErrorMessage(error), data: [] }
     }
   },
 
-  getByInvoice: (invoiceNumber: string) => {
+  getByInvoice: async (invoiceNumber: string, userId?: number) => {
     try {
-      const db = getDb()
-      const sale = db.prepare(`
-        SELECT s.*, u.FullName as cashierName 
-        FROM Sales s 
-        JOIN Users u ON s.UserID = u.UserID
-        WHERE s.InvoiceNumber = ?
-      `).get(invoiceNumber) as any
+      const sale = await get(
+        `SELECT s.*, u.FullName as cashierName
+         FROM Sales s
+         JOIN Users u ON s.UserID = u.UserID
+         WHERE s.InvoiceNumber = $1 AND ($2::int IS NULL OR s.UserID = $2::int)`,
+        [invoiceNumber, userId ?? null]
+      ) as any
 
       if (!sale) return { success: false, message: 'Invoice not found', data: null }
 
-      sale.items = db.prepare('SELECT * FROM SaleItems WHERE SaleID = ?').all(sale.SaleID)
-      sale.payments = db.prepare('SELECT * FROM Payments WHERE SaleID = ?').all(sale.SaleID)
+      sale.items = await all('SELECT * FROM SaleItems WHERE SaleID = $1', [sale.SaleID])
+      sale.payments = await all('SELECT * FROM Payments WHERE SaleID = $1', [sale.SaleID])
 
       return { success: true, data: sale, message: '' }
     } catch (error: any) {
@@ -327,28 +315,27 @@ export const saleService = {
     }
   },
 
-  getRange: (startDate: string, endDate: string) => {
+  getRange: async (startDate: string, endDate: string) => {
     try {
-      const db = getDb()
       if (!validDate(startDate) || !validDate(endDate)) {
         return { success: false, message: 'Choose a valid start and end date.', data: [] }
       }
       if (startDate > endDate) return { success: false, message: 'Start date cannot be after end date.', data: [] }
-      const data = db.prepare(`
-        WITH item_totals AS (
+      const data = await all(
+        `WITH item_totals AS (
           SELECT si.SaleID,
                  COUNT(si.SaleItemID) as itemCount,
-                 IFNULL(SUM(si.Quantity), 0) as itemsSold,
-                 ROUND(IFNULL(SUM(si.Quantity * COALESCE(NULLIF(si.UnitCost, 0), p.PurchasePrice, 0)), 0), 2) as totalCost,
-                 GROUP_CONCAT(si.ProductName || ' x' || si.Quantity, ', ') as itemSummary
+                 COALESCE(SUM(si.Quantity), 0) as itemsSold,
+                 round(COALESCE(SUM(si.Quantity * COALESCE(si.UnitCost, 0)), 0), 2) as totalCost,
+                 string_agg(si.ProductName || ' x' || si.Quantity, ', ') as itemSummary
           FROM SaleItems si
           LEFT JOIN Products p ON si.ProductID = p.ProductID
           GROUP BY si.SaleID
         ),
         payment_totals AS (
           SELECT SaleID,
-                 GROUP_CONCAT(PaymentMethod, ', ') as paymentMethods,
-                 IFNULL(SUM(Amount), 0) as collectedAmount
+                 string_agg(PaymentMethod, ', ') as paymentMethods,
+                 COALESCE(SUM(Amount), 0) as collectedAmount
           FROM Payments
           GROUP BY SaleID
         )
@@ -360,8 +347,8 @@ export const saleService = {
                c.Phone as customerPhone,
                u.FullName as cashierName,
                s.SaleDate as saleDate,
-               IFNULL(it.itemCount, 0) as itemCount,
-               IFNULL(it.itemsSold, 0) as itemsSold,
+               COALESCE(it.itemCount, 0) as itemCount,
+               COALESCE(it.itemsSold, 0) as itemsSold,
                it.itemSummary as itemSummary,
                s.SubTotal as subTotal,
                s.DiscountAmount as discountAmount,
@@ -370,69 +357,67 @@ export const saleService = {
                s.NetTotal as netTotal,
                s.PaidAmount as paidAmount,
                s.ChangeAmount as changeAmount,
-               ROUND(CASE
+               round(CASE
                  WHEN s.NetTotal > (s.PaidAmount - s.ChangeAmount) THEN s.NetTotal - (s.PaidAmount - s.ChangeAmount)
                  ELSE 0
                END, 2) as amountDue,
                s.PaymentStatus as paymentStatus,
-               IFNULL(pt.paymentMethods, 'Unpaid') as paymentMethods,
-               ROUND(s.PaidAmount, 2) as tenderedAmount,
-               ROUND(IFNULL(pt.collectedAmount, s.PaidAmount - s.ChangeAmount), 2) as collectedAmount,
-               ROUND(IFNULL(it.totalCost, 0), 2) as totalCost,
-               ROUND(IFNULL((s.SubTotal - s.DiscountAmount) - IFNULL(it.totalCost, 0), 0), 2) as grossProfit,
+               COALESCE(pt.paymentMethods, 'Unpaid') as paymentMethods,
+               round(s.PaidAmount, 2) as tenderedAmount,
+               round(COALESCE(pt.collectedAmount, s.PaidAmount - s.ChangeAmount), 2) as collectedAmount,
+               round(COALESCE(it.totalCost, 0), 2) as totalCost,
+               round(COALESCE((s.SubTotal - s.DiscountAmount) - COALESCE(it.totalCost, 0), 0), 2) as grossProfit,
                s.IsVoided as isVoided
         FROM Sales s
         JOIN Users u ON s.UserID = u.UserID
         LEFT JOIN Customers c ON s.CustomerID = c.CustomerID
         LEFT JOIN item_totals it ON s.SaleID = it.SaleID
         LEFT JOIN payment_totals pt ON s.SaleID = pt.SaleID
-        WHERE date(s.SaleDate) >= ? AND date(s.SaleDate) <= ? AND s.IsVoided = 0
-        ORDER BY s.SaleDate DESC
-      `).all(startDate, endDate)
+        WHERE (s.SaleDate)::date >= $1::date AND (s.SaleDate)::date <= $2::date AND s.IsVoided = false
+        ORDER BY s.SaleDate DESC`,
+        [startDate, endDate]
+      )
       return { success: true, data, message: '' }
     } catch (error: any) {
       return { success: false, message: publicErrorMessage(error), data: [] }
     }
   },
 
-  voidSale: (saleId: number, userId: number, reason: string): ServiceResult => {
-    const db = getDb()
-    const transaction = db.transaction(() => {
-      if (!Number.isInteger(saleId) || saleId <= 0) throw new Error('Invalid sale.')
-      const safeReason = String(reason ?? '').trim()
-      if (safeReason.length < 3 || safeReason.length > 500) throw new Error('Void reason must be between 3 and 500 characters.')
-      const sale = db.prepare('SELECT * FROM Sales WHERE SaleID = ?').get(saleId) as any
-      if (!sale) throw new Error('Sale not found')
-      if (sale.IsVoided) throw new Error('Sale is already voided')
-
-      // Mark sale void
-      db.prepare("UPDATE Sales SET IsVoided = 1, PaymentStatus = 'Voided', Notes = IFNULL(Notes, '') || ? WHERE SaleID = ?")
-        .run(` | Voided: ${safeReason}`, saleId)
-
-      // Revert Stock
-      const items = db.prepare('SELECT * FROM SaleItems WHERE SaleID = ?').all(saleId) as any[]
-      const updateStockStmt = db.prepare("UPDATE Products SET StockQuantity = StockQuantity + ?, UpdatedAt = datetime('now') WHERE ProductID = ?")
-      const insertInvStmt = db.prepare(`
-        INSERT INTO InventoryTransactions (ProductID, TransactionType, QuantityChange, OldStock, NewStock, UserID, Reason, SaleID)
-        VALUES (?, 'Void', ?, ?, ?, ?, ?, ?)
-      `)
-
-      for (const item of items) {
-        const prod = db.prepare('SELECT StockQuantity FROM Products WHERE ProductID = ?').get(item.ProductID) as any
-        if (prod) {
-          updateStockStmt.run(item.Quantity, item.ProductID)
-          insertInvStmt.run(
-            item.ProductID, item.Quantity, prod.StockQuantity, prod.StockQuantity + item.Quantity,
-            userId, `Voided Sale ${sale.InvoiceNumber}`, saleId
-          )
-        }
-      }
-
-      auditService.log('SALE_VOIDED', 'Sale', `Voided sale ${sale.InvoiceNumber}. Reason: ${safeReason}`, userId, saleId.toString())
-    })
-
+  voidSale: async (saleId: number, userId: number, reason: string): Promise<ServiceResult> => {
     try {
-      transaction()
+      await withTx(async (tx: Db) => {
+        if (!Number.isInteger(saleId) || saleId <= 0) throw new PublicError('Invalid sale.')
+        const safeReason = String(reason ?? '').trim()
+        if (safeReason.length < 3 || safeReason.length > 500) throw new PublicError('Void reason must be between 3 and 500 characters.')
+        const sale = await tx.get('SELECT * FROM Sales WHERE SaleID = $1', [saleId]) as any
+        if (!sale) throw new PublicError('Sale not found')
+        if (sale.IsVoided) throw new PublicError('Sale is already voided')
+
+        // Mark sale void
+        await tx.run(
+          "UPDATE Sales SET IsVoided = true, PaymentStatus = 'Voided', Notes = COALESCE(Notes, '') || $1 WHERE SaleID = $2",
+          [` | Voided: ${safeReason}`, saleId]
+        )
+
+        // Revert Stock
+        const items = await tx.all('SELECT * FROM SaleItems WHERE SaleID = $1', [saleId]) as any[]
+        for (const item of items) {
+          const prod = await tx.get('SELECT StockQuantity FROM Products WHERE ProductID = $1', [item.ProductID]) as any
+          if (prod) {
+            await tx.run(
+              "UPDATE Products SET StockQuantity = StockQuantity + $1, UpdatedAt = now() WHERE ProductID = $2",
+              [item.Quantity, item.ProductID]
+            )
+            await tx.run(
+              `INSERT INTO InventoryTransactions (ProductID, TransactionType, QuantityChange, OldStock, NewStock, UserID, Reason, SaleID)
+               VALUES ($1, 'Void', $2, $3, $4, $5, $6, $7)`,
+              [item.ProductID, item.Quantity, prod.StockQuantity, prod.StockQuantity + item.Quantity, userId, `Voided Sale ${sale.InvoiceNumber}`, saleId]
+            )
+          }
+        }
+
+        await auditService.log('SALE_VOIDED', 'Sale', `Voided sale ${sale.InvoiceNumber}. Reason: ${safeReason}`, userId, saleId.toString(), tx)
+      })
       return { success: true, message: 'Sale voided and stock restored successfully' }
     } catch (error: any) {
       logger.error('Failed to void sale', error)

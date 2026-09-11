@@ -1,3 +1,4 @@
+import { AccountScreen } from './management/AccountScreen'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BarChart3,
@@ -5,7 +6,6 @@ import {
   ChevronRight,
   Clock,
   CreditCard,
-  Home,
   LogIn,
   LogOut,
   Minus,
@@ -106,10 +106,8 @@ const defaultStoreSettings: StoreSettings = {
   ReceiptShowAddress: 'true'
 }
 
-const mockProducts: ProductCard[] = []
 
 const navItems = [
-  { id: 'dashboard', icon: Home, label: 'Dashboard', adminOnly: true },
   { id: 'checkout', icon: ShoppingCart, label: 'Checkout', adminOnly: false },
   { id: 'products', icon: Package, label: 'Products', adminOnly: true },
   { id: 'stock', icon: Package, label: 'Stock', adminOnly: true },
@@ -117,10 +115,13 @@ const navItems = [
   { id: 'debts', icon: CreditCard, label: 'Debts', adminOnly: true },
   { id: 'reports', icon: BarChart3, label: 'Reports', adminOnly: true },
   { id: 'users', icon: Users, label: 'Users', adminOnly: true },
-  { id: 'settings', icon: Settings, label: 'Settings', adminOnly: true }
+  { id: 'settings', icon: Settings, label: 'Settings', adminOnly: true },
+  { id: 'account', icon: ShieldCheck, label: 'My Account', adminOnly: false }
 ]
 
 type ScreenId = (typeof navItems)[number]['id']
+
+const roundMoney = (value: number) => Math.round(value * 100) / 100
 
 const currency = new Intl.NumberFormat('en-PK', {
   style: 'currency',
@@ -155,7 +156,7 @@ function normalizeProduct(raw: any): ProductCard | null {
   }
 }
 
-function normalizeProducts(response: any, fallback = mockProducts): ProductCard[] {
+function normalizeProducts(response: any, fallback: ProductCard[] = []): ProductCard[] {
   if (!response) return fallback
   if (response?.success === false) return []
   const rows = unwrapData<any[]>(response, [])
@@ -205,6 +206,8 @@ export default function POSPage() {
   const [user, setUser] = useState<User | null>(null)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [isSigningIn, setIsSigningIn] = useState(false)
+  const saleInFlight = useRef(false)
   const [loginMessage, setLoginMessage] = useState('')
   const [loginMessageTone, setLoginMessageTone] = useState<'success' | 'error'>('error')
   const [setupChecked, setSetupChecked] = useState(false)
@@ -217,7 +220,7 @@ export default function POSPage() {
   })
   const [setupMessage, setSetupMessage] = useState('')
   const [isSettingUp, setIsSettingUp] = useState(false)
-  const [products, setProducts] = useState<ProductCard[]>(mockProducts)
+  const [products, setProducts] = useState<ProductCard[]>([])
   const [cart, setCart] = useState<CartLine[]>([])
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<ProductCard[]>([])
@@ -238,6 +241,7 @@ export default function POSPage() {
   const [lastInvoice, setLastInvoice] = useState<string | null>(null)
   const [clock, setClock] = useState(() => new Date())
   const [activeScreen, setActiveScreen] = useState<ScreenId>('checkout')
+  const searchSequence = useRef(0)
   const searchRef = useRef<HTMLDivElement>(null)
   const screenScrollRef = useRef<HTMLDivElement>(null)
   const checkoutScrollRef = useRef<HTMLElement>(null)
@@ -251,13 +255,13 @@ export default function POSPage() {
     () => cart.reduce((sum, item) => sum + item.price * item.quantity, 0),
     [cart]
   )
-  const discountAmount = subtotal * (discountPercent / 100)
+  const discountAmount = roundMoney(subtotal * (discountPercent / 100))
   const taxableAmount = Math.max(0, subtotal - discountAmount)
-  const taxAmount = taxableAmount * (taxPercent / 100)
-  const total = taxableAmount + taxAmount
+  const taxAmount = roundMoney(taxableAmount * (taxPercent / 100))
+  const total = roundMoney(taxableAmount + taxAmount)
   const paid = Number(amountPaid || 0)
   const changeDue = Math.max(0, paid - total)
-  const amountDue = Math.max(0, total - paid)
+  const amountDue = roundMoney(Math.max(0, total - paid))
   const hasValidPaidAmount = amountPaid.trim().length > 0 && Number.isFinite(paid) && paid >= 0
   const isDebtSale = hasValidPaidAmount && amountDue > 0
   const cartCount = cart.reduce((sum, item) => sum + item.quantity, 0)
@@ -306,10 +310,11 @@ export default function POSPage() {
     try {
       if (window.api?.getProducts) {
         const response = await window.api.getProducts()
+        if (!response?.success) throw new Error(response?.message || 'Could not load products.')
         setProducts(normalizeProducts(response, []))
       }
 
-      if (window.api?.getDashboard) {
+      if (user?.roleName === 'Admin' && window.api?.getDashboard) {
         const response = await window.api.getDashboard()
         setDashboard(unwrapData<DashboardData | null>(response, null))
       }
@@ -324,14 +329,15 @@ export default function POSPage() {
     } catch (error: any) {
       setNotice({ tone: 'error', text: error?.message ?? 'Could not load product data.' })
     }
-  }, [])
+  }, [user?.roleName])
 
   useEffect(() => {
     let mounted = true
 
     const checkSetup = async () => {
       try {
-        const response = await window.api?.getSetupStatus?.()
+        if (!window.api?.getSetupStatus) throw new Error('Desktop connection unavailable. Restart SecureStore POS.')
+        const response = await window.api.getSetupStatus()
         if (!mounted) return
 
         setSetupRequired(Boolean(response?.success && response.data?.setupRequired))
@@ -370,6 +376,12 @@ export default function POSPage() {
       loadProducts()
     }
   }, [activeScreen, loadProducts, user])
+
+  useEffect(() => {
+    if (!user) return
+    const timer = window.setInterval(() => { void window.api?.getSessionStatus?.() }, 15_000)
+    return () => window.clearInterval(timer)
+  }, [user])
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(new Date()), 30_000)
@@ -426,6 +438,8 @@ export default function POSPage() {
   }, [])
 
   const handleLogin = async () => {
+    if (isSigningIn) return
+    setIsSigningIn(true)
     setLoginMessage('')
     setLoginMessageTone('error')
 
@@ -438,26 +452,19 @@ export default function POSPage() {
           return
         }
 
+        setPassword('')
         setUser(response.user)
         setActiveScreen('checkout')
         await loadProducts()
         return
       }
 
-      setUser({
-        userId: 1,
-        username,
-        fullName: 'Demo Admin',
-        roleId: 1,
-        roleName: 'Admin',
-        status: 'Active',
-        failedLoginAttempts: 0,
-        createdAt: new Date().toISOString()
-      })
-      setActiveScreen('checkout')
+      throw new Error('Desktop connection unavailable. Restart SecureStore POS.')
     } catch (error: any) {
       setLoginMessageTone('error')
       setLoginMessage(error?.message ?? 'Unable to sign in.')
+    } finally {
+      setIsSigningIn(false)
     }
   }
 
@@ -496,16 +503,55 @@ export default function POSPage() {
   }
 
   const handleLogout = async () => {
-    await window.api?.logout?.()
+    try { await window.api?.logout?.() } catch { /* Clear local session even if the bridge fails. */ }
     setUser(null)
+    setDashboard(null)
+    setProducts([])
+    setSearchResults([])
+    setPassword('')
+    setReceipt(null)
+    setPurchaseStep('closed')
+    setCustomerName('')
+    setCustomerFatherName('')
+    setCustomerPhone('')
+    setCustomerAccountNumber('')
     setCart([])
     setNotice(null)
     setLastInvoice(null)
     setActiveScreen('checkout')
   }
 
+  useEffect(() => {
+    const expire = () => {
+      void handleLogout()
+      setLoginMessageTone('error')
+      setLoginMessage('Your session ended. Sign in to continue.')
+    }
+    window.addEventListener('pos:session-expired', expire)
+    return () => window.removeEventListener('pos:session-expired', expire)
+  }, [])
+
+  useEffect(() => {
+    if (purchaseStep === 'closed') return
+    const previous = document.activeElement as HTMLElement | null
+    const modal = document.querySelector<HTMLElement>('[role="dialog"]')
+    const focusable = () => Array.from(modal?.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select, [tabindex="0"]') ?? [])
+    focusable()[0]?.focus()
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !saleInFlight.current) setPurchaseStep('closed')
+      if (event.key !== 'Tab') return
+      const nodes = focusable()
+      const first = nodes[0], last = nodes[nodes.length - 1]
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+    }
+    document.addEventListener('keydown', keydown)
+    return () => { document.removeEventListener('keydown', keydown); previous?.focus() }
+  }, [purchaseStep])
+
   const searchProducts = useCallback(
     async (query: string) => {
+      const sequence = ++searchSequence.current
       setSearchQuery(query)
       setNotice(null)
 
@@ -518,16 +564,10 @@ export default function POSPage() {
       try {
         if (window.api?.searchProducts) {
           const response = await window.api.searchProducts(query)
+          if (sequence !== searchSequence.current) return
           setSearchResults(normalizeProducts(response, []))
         } else {
-          const lowered = query.toLowerCase()
-          setSearchResults(
-            mockProducts.filter((product) =>
-              [product.name, product.brand, product.category]
-                .filter(Boolean)
-                .some((value) => String(value).toLowerCase().includes(lowered))
-            )
-          )
+          throw new Error('Product search is unavailable. Restart the app.')
         }
 
         setShowSearchResults(true)
@@ -632,6 +672,10 @@ export default function POSPage() {
       return
     }
 
+    if (saleInFlight.current) return
+    saleInFlight.current = true
+    setIsProcessing(true)
+    try {
     let cartForSale = cart
     if (window.api?.getProducts) {
       const latestProducts = normalizeProducts(await window.api.getProducts(), [])
@@ -639,6 +683,11 @@ export default function POSPage() {
       const availabilityError = validateCartAvailability(cart, latestProducts)
       if (availabilityError) {
         setNotice({ tone: 'error', text: availabilityError })
+        return
+      }
+      if (cart.some(line => latestProducts.find(p => p.id === line.id)?.price !== line.price)) {
+        setCart(cart.map(line => ({ ...line, ...latestProducts.find(p => p.id === line.id) })))
+        setNotice({ tone: 'error', text: 'Product prices changed. Review the updated bill before completing the sale.' })
         return
       }
       const latestById = new Map(latestProducts.map((product) => [product.id, product]))
@@ -649,12 +698,12 @@ export default function POSPage() {
     }
 
     const saleSubtotal = cartForSale.reduce((sum, item) => sum + item.price * item.quantity, 0)
-    const saleDiscountAmount = saleSubtotal * (discountPercent / 100)
+    const saleDiscountAmount = roundMoney(saleSubtotal * (discountPercent / 100))
     const saleTaxableAmount = Math.max(0, saleSubtotal - saleDiscountAmount)
-    const saleTaxAmount = saleTaxableAmount * (taxPercent / 100)
-    const saleTotal = saleTaxableAmount + saleTaxAmount
+    const saleTaxAmount = roundMoney(saleTaxableAmount * (taxPercent / 100))
+    const saleTotal = roundMoney(saleTaxableAmount + saleTaxAmount)
     const saleChangeDue = Math.max(0, paid - saleTotal)
-    const saleAmountDue = Math.max(0, saleTotal - paid)
+    const saleAmountDue = roundMoney(Math.max(0, saleTotal - paid))
     const saleIsDebt = saleAmountDue > 0
     const accountNumberForSale = saleIsDebt ? customerAccountNumber.trim() : ''
     const customerNameForSale = saleIsDebt ? customerName.trim() : ''
@@ -707,14 +756,11 @@ export default function POSPage() {
       paidAmount: paid,
       paymentMethod: 'Cash',
       notes: saleIsDebt
-        ? `Account sale${accountNumberForSale ? ` for ${accountNumberForSale}` : ''}: ${receiptDraft.customerName}, father ${receiptDraft.customerFatherName}, mobile ${receiptDraft.customerPhone}. Completed from Electron checkout UI.`
-        : `Walk-in/full payment sale completed from Electron checkout UI.`
+        ? `Account sale${accountNumberForSale ? ` for ${accountNumberForSale}` : ''}: ${receiptDraft.customerName}, father ${receiptDraft.customerFatherName}, mobile ${receiptDraft.customerPhone}. Sale recorded.`
+        : `Walk-in cash sale.`
     }
 
-    setIsProcessing(true)
-    setNotice({ tone: 'info', text: 'Completing purchase through the secure transaction service...' })
-
-    try {
+    setNotice({ tone: 'info', text: 'Saving sale…' })
       if (window.api?.completeSale) {
         const response = (await window.api.completeSale(saleRequest)) as SaleResult
         if (!response.success) throw new Error(response.message)
@@ -725,6 +771,8 @@ export default function POSPage() {
           invoiceNumber: response.invoiceNumber ?? 'Unknown',
           customerId: response.customerId,
           customerAccountNumber: response.customerAccountNumber ?? receiptDraft.customerAccountNumber,
+          total: response.netTotal ?? receiptDraft.total,
+          changeDue: response.changeAmount ?? receiptDraft.changeDue,
           amountDue: response.amountDue ?? receiptDraft.amountDue,
           paymentStatus: response.paymentStatus ?? receiptDraft.paymentStatus
         })
@@ -733,10 +781,7 @@ export default function POSPage() {
           text: `${response.message} ${response.invoiceNumber ? `Invoice ${response.invoiceNumber}` : ''}${response.amountDue ? ` · Due ${currency.format(response.amountDue)}` : ''}`.trim()
         })
       } else {
-        const invoiceNumber = `DEMO-${Date.now()}`
-        setLastInvoice(invoiceNumber)
-        setReceipt({ ...receiptDraft, invoiceNumber })
-        setNotice({ tone: 'success', text: 'Demo sale completed. Backend bridge was not available.' })
+        throw new Error('Desktop connection unavailable. Sale was not saved.')
       }
 
       setCart([])
@@ -751,6 +796,7 @@ export default function POSPage() {
     } catch (error: any) {
       setNotice({ tone: 'error', text: error?.message ?? 'Sale failed. No partial sale was saved.' })
     } finally {
+      saleInFlight.current = false
       setIsProcessing(false)
     }
   }
@@ -759,37 +805,31 @@ export default function POSPage() {
     const showSetup = setupChecked && setupRequired
 
     return (
-      <div
-        className="min-h-screen bg-cover bg-center p-6 text-slate-100"
-        style={{
-          backgroundImage:
-            "linear-gradient(90deg, rgba(8, 18, 10, 0.78), rgba(8, 18, 10, 0.38), rgba(8, 18, 10, 0.72)), url('/login-background.png')"
-        }}
-      >
+      <div className="min-h-screen bg-slate-100 p-6 text-slate-900">
         <div className="mx-auto flex min-h-[calc(100vh-3rem)] max-w-6xl items-center justify-center">
-          <section className="w-full max-w-md overflow-hidden rounded-2xl border border-white/25 bg-white/15 shadow-2xl backdrop-blur-md">
+          <section className="w-full max-w-md overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
             {!setupChecked ? (
-              <div className="p-8 text-center text-white md:p-10">
-                <ShieldCheck className="mx-auto mb-4 h-10 w-10 text-emerald-200" />
-                <h2 className="text-3xl font-black">Preparing</h2>
+              <div className="p-8 text-center text-slate-900 md:p-10">
+                <ShieldCheck className="mx-auto mb-4 h-10 w-10 text-indigo-600" />
+                <h2 className="text-3xl font-semibold">Preparing</h2>
               </div>
             ) : showSetup ? (
               <form
-                className="p-8 text-white md:p-10"
+                className="p-8 text-slate-900 md:p-10"
                 onSubmit={(event) => {
                   event.preventDefault()
                   handleInitialSetup()
                 }}
               >
                 <div className="mb-8 text-center">
-                  <ShieldCheck className="mx-auto mb-3 h-10 w-10 text-emerald-200" />
-                  <h2 className="text-3xl font-black">Create admin</h2>
+                  <ShieldCheck className="mx-auto mb-3 h-10 w-10 text-indigo-600" />
+                  <h2 className="text-3xl font-semibold">Create admin</h2>
                 </div>
 
                 <label className="mb-4 block">
-                  <span className="mb-2 block text-sm font-semibold text-white">Username</span>
+                  <span className="mb-2 block text-sm font-semibold text-slate-900">Username</span>
                   <input
-                    className="h-12 w-full rounded-xl border border-white/35 bg-white/25 px-4 text-white outline-none ring-emerald-400 transition placeholder:text-white/65 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
+                    className="h-12 w-full rounded-xl border border-slate-300 bg-white px-4 text-slate-900 outline-none ring-emerald-400 transition placeholder:text-slate-400 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
                     value={setupForm.username}
                     onChange={(event) => setSetupForm({ ...setupForm, username: event.target.value })}
                     autoComplete="username"
@@ -797,9 +837,9 @@ export default function POSPage() {
                 </label>
 
                 <label className="mb-4 block">
-                  <span className="mb-2 block text-sm font-semibold text-white">Full name</span>
+                  <span className="mb-2 block text-sm font-semibold text-slate-900">Full name</span>
                   <input
-                    className="h-12 w-full rounded-xl border border-white/35 bg-white/25 px-4 text-white outline-none ring-emerald-400 transition placeholder:text-white/65 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
+                    className="h-12 w-full rounded-xl border border-slate-300 bg-white px-4 text-slate-900 outline-none ring-emerald-400 transition placeholder:text-slate-400 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
                     value={setupForm.fullName}
                     onChange={(event) => setSetupForm({ ...setupForm, fullName: event.target.value })}
                     autoComplete="name"
@@ -807,9 +847,9 @@ export default function POSPage() {
                 </label>
 
                 <label className="mb-4 block">
-                  <span className="mb-2 block text-sm font-semibold text-white">Password</span>
+                  <span className="mb-2 block text-sm font-semibold text-slate-900">Password</span>
                   <input
-                    className="h-12 w-full rounded-xl border border-white/35 bg-white/25 px-4 text-white outline-none ring-emerald-400 transition placeholder:text-white/65 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
+                    className="h-12 w-full rounded-xl border border-slate-300 bg-white px-4 text-slate-900 outline-none ring-emerald-400 transition placeholder:text-slate-400 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
                     type="password"
                     value={setupForm.plainPassword}
                     onChange={(event) => setSetupForm({ ...setupForm, plainPassword: event.target.value })}
@@ -818,9 +858,9 @@ export default function POSPage() {
                 </label>
 
                 <label className="mb-4 block">
-                  <span className="mb-2 block text-sm font-semibold text-white">Confirm password</span>
+                  <span className="mb-2 block text-sm font-semibold text-slate-900">Confirm password</span>
                   <input
-                    className="h-12 w-full rounded-xl border border-white/35 bg-white/25 px-4 text-white outline-none ring-emerald-400 transition placeholder:text-white/65 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
+                    className="h-12 w-full rounded-xl border border-slate-300 bg-white px-4 text-slate-900 outline-none ring-emerald-400 transition placeholder:text-slate-400 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
                     type="password"
                     value={setupForm.confirmPassword}
                     onChange={(event) => setSetupForm({ ...setupForm, confirmPassword: event.target.value })}
@@ -829,32 +869,34 @@ export default function POSPage() {
                 </label>
 
                 {setupMessage && (
-                  <p className="mb-4 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm font-medium text-rose-700">
+                  <p role="alert" className="mb-4 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm font-medium text-rose-700">
                     {setupMessage}
                   </p>
                 )}
 
-                <button disabled={isSettingUp} className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-emerald-600/90 font-bold text-white shadow-glow transition hover:bg-emerald-500 disabled:opacity-60">
+                <button disabled={isSettingUp} className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 font-bold text-white shadow-sm transition hover:bg-indigo-700 disabled:opacity-60">
                   <ShieldCheck className="h-5 w-5" />
                   {isSettingUp ? 'Creating admin...' : 'Create admin'}
                 </button>
               </form>
             ) : (
               <form
-                className="p-8 text-white md:p-10"
+                className="p-8 text-slate-900 md:p-10"
                 onSubmit={(event) => {
                   event.preventDefault()
                   handleLogin()
                 }}
               >
                 <div className="mb-8 text-center">
-                  <h2 className="text-3xl font-black">Sign in</h2>
+                  <p className="mb-2 text-sm font-semibold text-indigo-600">SecureStore POS</p>
+                  <h2 className="text-3xl font-semibold">Sign in</h2>
+                  <p className="mt-2 text-sm text-slate-500">Manage your shop and serve your customers.</p>
                 </div>
 
                 <label className="mb-4 block">
-                  <span className="mb-2 block text-sm font-semibold text-white">Username</span>
+                  <span className="mb-2 block text-sm font-semibold text-slate-900">Username</span>
                   <input
-                    className="h-12 w-full rounded-xl border border-white/35 bg-white/25 px-4 text-white outline-none ring-emerald-400 transition placeholder:text-white/65 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
+                    className="h-12 w-full rounded-xl border border-slate-300 bg-white px-4 text-slate-900 outline-none ring-emerald-400 transition placeholder:text-slate-400 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
                     value={username}
                     onChange={(event) => setUsername(event.target.value)}
                     autoComplete="username"
@@ -862,9 +904,9 @@ export default function POSPage() {
                 </label>
 
                 <label className="mb-4 block">
-                  <span className="mb-2 block text-sm font-semibold text-white">Password</span>
+                  <span className="mb-2 block text-sm font-semibold text-slate-900">Password</span>
                   <input
-                    className="h-12 w-full rounded-xl border border-white/35 bg-white/25 px-4 text-white outline-none ring-emerald-400 transition placeholder:text-white/65 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
+                    className="h-12 w-full rounded-xl border border-slate-300 bg-white px-4 text-slate-900 outline-none ring-emerald-400 transition placeholder:text-slate-400 focus:border-emerald-300 focus:ring-4 focus:ring-emerald-200/25"
                     type="password"
                     value={password}
                     onChange={(event) => setPassword(event.target.value)}
@@ -873,7 +915,7 @@ export default function POSPage() {
                 </label>
 
                 {loginMessage && (
-                  <p className={`mb-4 rounded-xl border p-3 text-sm font-medium ${
+                  <p role="alert" className={`mb-4 rounded-xl border p-3 text-sm font-medium ${
                     loginMessageTone === 'success'
                       ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
                       : 'border-rose-200 bg-rose-50 text-rose-700'
@@ -882,9 +924,9 @@ export default function POSPage() {
                   </p>
                 )}
 
-                <button className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-emerald-600/90 font-bold text-white shadow-glow transition hover:bg-emerald-500">
+                <button disabled={isSigningIn} className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 font-bold text-white shadow-sm transition hover:bg-indigo-700">
                   <LogIn className="h-5 w-5" />
-                  Sign in
+                  {isSigningIn ? 'Signing in…' : 'Sign in'}
                 </button>
               </form>
             )}
@@ -896,13 +938,13 @@ export default function POSPage() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-slate-100 text-slate-950">
-      <aside className="no-print flex w-56 flex-col bg-slate-950 px-4 py-6 text-white shadow-2xl">
+      <aside className="no-print flex w-56 flex-col bg-slate-950 px-4 py-6 text-white shadow-sm">
         <div className="mb-8 flex items-center gap-3">
-          <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-cyan-400 shadow-glow">
+          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-indigo-600 shadow-sm">
             <Sparkles className="h-6 w-6" />
           </div>
           <div>
-            <p className="text-sm font-black uppercase tracking-wide text-cyan-200">SecureStore</p>
+            <p className="text-sm font-semibold uppercase tracking-wide text-cyan-200">SecureStore</p>
             <p className="text-xs font-semibold text-slate-400">POS System</p>
           </div>
         </div>
@@ -911,27 +953,28 @@ export default function POSPage() {
           {accessibleNavItems.map((item) => (
             <button
               key={item.label}
+              aria-current={activeScreen === item.id ? 'page' : undefined}
               onClick={() => setActiveScreen(item.id)}
-              className={`flex h-12 items-center gap-3 rounded-2xl px-3 text-left transition ${
+              className={`flex h-12 items-center gap-3 rounded-xl px-3 text-left transition ${
                 activeScreen === item.id
-                  ? 'bg-gradient-to-br from-indigo-500 to-cyan-400 text-white shadow-glow'
+                  ? 'bg-indigo-600 text-white shadow-sm'
                   : 'text-slate-400 hover:bg-white/10 hover:text-white'
               }`}
               title={item.label}
             >
               <item.icon className="h-5 w-5" />
-              <span className="text-sm font-black">{item.label}</span>
+              <span className="text-sm font-semibold">{item.label}</span>
             </button>
           ))}
         </nav>
 
         <button
-          className="flex h-12 items-center gap-3 rounded-2xl px-3 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-300"
+          className="flex h-12 items-center gap-3 rounded-xl px-3 text-slate-400 transition hover:bg-rose-500/10 hover:text-rose-300"
           onClick={handleLogout}
           title="Sign out"
         >
           <LogOut className="h-5 w-5" />
-          <span className="text-sm font-black">Sign out</span>
+          <span className="text-sm font-semibold">Sign out</span>
         </button>
       </aside>
 
@@ -939,7 +982,7 @@ export default function POSPage() {
         <header className="no-print flex h-20 items-center justify-between border-b border-slate-200 bg-white px-6">
           <div>
             <div className="flex items-center gap-3">
-              <h1 className="text-2xl font-black tracking-tight">
+              <h1 className="text-2xl font-semibold tracking-tight">
                 {accessibleNavItems.find((item) => item.id === activeScreen)?.label || 'Point of Sale'}
               </h1>
               <span className="inline-flex items-center gap-1.5 rounded-full border border-cyan-200 bg-cyan-50 px-3 py-1 text-sm font-bold text-cyan-700">
@@ -950,24 +993,24 @@ export default function POSPage() {
             <p className="mt-1 text-sm text-slate-500">
               {dashboard
                 ? `${dashboard.todayTransactions} sales today · ${currency.format(dashboard.todayRevenue)} received · ${currency.format(dashboard.todayNetSales ?? dashboard.todayRevenue)} net sales${dashboard.todayOutstanding ? ` · ${currency.format(dashboard.todayOutstanding)} due` : ''}`
-                : 'Checkout terminal connected through window.api'}
+                : 'Ready for checkout'}
             </p>
           </div>
 
             <div className="flex items-center gap-3">
               <div className="rounded-full bg-emerald-50 px-3 py-1.5 text-sm font-bold text-emerald-700">
-                Terminal Active
+                Local workspace
               </div>
               <div className="flex rounded-full border border-slate-200 bg-slate-50 p-1">
                 <button
                   onClick={() => scrollActiveScreen('up')}
-                  className="rounded-full px-3 py-1 text-sm font-black text-slate-600 hover:bg-white"
+                  className="rounded-full px-3 py-1 text-sm font-semibold text-slate-600 hover:bg-white"
                 >
                   Up
                 </button>
                 <button
                   onClick={() => scrollActiveScreen('down')}
-                  className="rounded-full px-3 py-1 text-sm font-black text-slate-600 hover:bg-white"
+                  className="rounded-full px-3 py-1 text-sm font-semibold text-slate-600 hover:bg-white"
                 >
                   Down
                 </button>
@@ -975,12 +1018,12 @@ export default function POSPage() {
               {activeScreen === 'checkout' && isAdmin && (
                 <button
                   onClick={() => setActiveScreen('products')}
-                  className="rounded-full bg-indigo-600 px-4 py-2 text-sm font-black text-white shadow-sm transition hover:bg-indigo-700"
+                  className="rounded-full bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700"
                 >
                   Add / Manage Products
                 </button>
               )}
-              <div className="flex h-11 w-11 items-center justify-center rounded-full bg-gradient-to-br from-indigo-600 to-cyan-500 font-black text-white">
+              <div className="flex h-11 w-11 items-center justify-center rounded-full bg-indigo-600 font-semibold text-white">
                 {initials(user)}
               </div>
           </div>
@@ -992,7 +1035,7 @@ export default function POSPage() {
           tabIndex={0}
           className="min-h-0 flex-1 overflow-y-auto outline-none"
         >
-        {isAdmin && activeScreen === 'dashboard' && <ReportsScreen />}
+        {activeScreen === 'account' && <AccountScreen user={user} />}
         {isAdmin && activeScreen === 'products' && <ProductsScreen userId={user.userId} />}
         {isAdmin && activeScreen === 'stock' && <StockScreen userId={user.userId} />}
         {isAdmin && activeScreen === 'debts' && <DebtsScreen />}
@@ -1009,14 +1052,14 @@ export default function POSPage() {
               <div ref={searchRef} className="relative flex-1">
                 <Search className="pointer-events-none absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-slate-400" />
                 <input
-                  className="h-14 w-full rounded-2xl border-2 border-white bg-white pl-12 pr-4 text-base font-medium shadow-sm outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100"
+                  className="h-14 w-full rounded-xl border-2 border-white bg-white pl-12 pr-4 text-base font-medium shadow-sm outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-100"
                   placeholder="Search products by name, brand, or category..."
                   value={searchQuery}
                   onChange={(event) => searchProducts(event.target.value)}
                 />
 
                 {showSearchResults && (
-                  <div className="absolute left-0 right-0 top-full z-40 mt-2 max-h-80 overflow-auto rounded-2xl border border-slate-200 bg-white shadow-2xl">
+                  <div className="absolute left-0 right-0 top-full z-40 mt-2 max-h-80 overflow-auto rounded-xl border border-slate-200 bg-white shadow-sm">
                     {searchResults.length === 0 ? (
                       <div className="p-4 text-sm font-medium text-slate-500">No matching products found.</div>
                     ) : (
@@ -1026,7 +1069,7 @@ export default function POSPage() {
                           className="flex w-full items-center gap-4 border-b border-slate-100 p-4 text-left transition last:border-0 hover:bg-indigo-50"
                           onClick={() => addToCart(product)}
                         >
-                          <span className="flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-100 to-cyan-100 text-indigo-600">
+                          <span className="flex h-12 w-12 items-center justify-center rounded-xl bg-slate-50 text-indigo-600">
                             <Package className="h-6 w-6" />
                           </span>
                           <span className="min-w-0 flex-1">
@@ -1036,7 +1079,7 @@ export default function POSPage() {
                             </span>
                           </span>
                           <span className="text-right">
-                            <span className="block text-lg font-black text-indigo-600">{currency.format(product.price)}</span>
+                            <span className="block text-lg font-semibold text-indigo-600">{currency.format(product.price)}</span>
                             <span className="block text-xs font-semibold text-slate-500">{product.stock} in stock</span>
                           </span>
                           <ChevronRight className="h-5 w-5 text-slate-400" />
@@ -1051,7 +1094,7 @@ export default function POSPage() {
 
             {notice && (
               <div
-                className={`no-print flex items-center justify-between rounded-2xl border px-4 py-3 text-sm font-semibold ${
+                role="status" aria-live="polite" className={`no-print flex items-center justify-between rounded-xl border px-4 py-3 text-sm font-semibold ${
                   notice.tone === 'success'
                     ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
                     : notice.tone === 'error'
@@ -1066,9 +1109,9 @@ export default function POSPage() {
               </div>
             )}
 
-            <div className="min-h-0 flex-1 overflow-hidden rounded-3xl border border-white bg-white shadow-xl">
-              <div className="no-print flex items-center justify-between border-b border-slate-100 bg-gradient-to-r from-indigo-50 via-white to-cyan-50 p-5">
-                <h2 className="flex items-center gap-2 text-lg font-black">
+            <div className="min-h-0 flex-1 overflow-hidden rounded-xl border border-white bg-white shadow-sm">
+              <div className="no-print flex items-center justify-between border-b border-slate-100 bg-slate-50 p-5">
+                <h2 className="flex items-center gap-2 text-lg font-semibold">
                   <Tag className="h-5 w-5 text-indigo-600" />
                   Quick Pick Items
                 </h2>
@@ -1081,21 +1124,21 @@ export default function POSPage() {
                 {products.slice(0, 12).map((product) => (
                   <button
                     key={product.id}
-                    className="group relative flex min-h-44 flex-col rounded-2xl border-2 border-slate-100 bg-white p-4 text-left transition hover:border-indigo-300 hover:shadow-glow"
+                    className="group relative flex min-h-44 flex-col rounded-xl border-2 border-slate-100 bg-white p-4 text-left transition hover:border-indigo-300 hover:shadow-sm"
                     onClick={() => addToCart(product)}
                   >
                     <span className="absolute right-3 top-3 rounded-full border border-indigo-100 bg-indigo-50 px-2.5 py-1 text-xs font-bold text-indigo-700">
                       {product.category}
                     </span>
-                    <span className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-slate-100 to-cyan-100 text-slate-500 transition group-hover:scale-105 group-hover:text-indigo-600">
+                    <span className="mb-4 flex h-14 w-14 items-center justify-center rounded-xl bg-slate-50 text-slate-500 transition  group-hover:text-indigo-600">
                       <Package className="h-7 w-7" />
                     </span>
-                    <span className="block min-h-12 pr-12 text-sm font-black leading-snug">{product.name}</span>
+                    <span className="block min-h-12 pr-12 text-sm font-semibold leading-snug">{product.name}</span>
                     <span className="mt-1 block truncate text-xs font-semibold text-slate-500">
                       {product.brand || 'General item'}
                     </span>
                     <span className="mt-auto flex items-end justify-between pt-4">
-                      <span className="text-xl font-black text-indigo-600">{currency.format(product.price)}</span>
+                      <span className="text-xl font-semibold text-indigo-600">{currency.format(product.price)}</span>
                       <span className="text-xs font-bold text-slate-500">{product.stock} left</span>
                     </span>
                   </button>
@@ -1105,13 +1148,13 @@ export default function POSPage() {
           </div>
 
           <aside className="flex min-h-0 flex-col gap-4">
-            <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-3xl border border-white bg-white shadow-xl">
-              <div className="flex items-center justify-between border-b border-slate-100 bg-gradient-to-r from-indigo-50 to-white p-5">
-                <h2 className="flex items-center gap-2 text-lg font-black">
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-white bg-white shadow-sm">
+              <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50 p-5">
+                <h2 className="flex items-center gap-2 text-lg font-semibold">
                   <ShoppingCart className="h-5 w-5 text-indigo-600" />
                   Shopping Cart
                 </h2>
-                <span className="rounded-full bg-indigo-600 px-3 py-1 text-sm font-black text-white">
+                <span className="rounded-full bg-indigo-600 px-3 py-1 text-sm font-semibold text-white">
                   {cartCount} items
                 </span>
               </div>
@@ -1128,7 +1171,7 @@ export default function POSPage() {
                     {cart.map((item) => (
                       <div key={item.id} className="grid grid-cols-[1fr_auto] gap-3 p-4">
                         <div className="min-w-0">
-                          <p className="truncate font-black">{item.name}</p>
+                          <p className="truncate font-semibold">{item.name}</p>
                           <p className="text-sm font-semibold text-slate-500">{currency.format(item.price)} each</p>
                           <div className="mt-3 flex items-center gap-2">
                             <button
@@ -1140,7 +1183,7 @@ export default function POSPage() {
                             </button>
                             <input
                               aria-label={`Quantity for ${item.name}`}
-                              className="h-8 w-16 rounded-lg border border-slate-200 bg-slate-50 px-2 text-center font-black text-slate-950 outline-none transition focus:border-indigo-400 focus:bg-white focus:ring-2 focus:ring-indigo-100"
+                              className="h-8 w-16 rounded-lg border border-slate-200 bg-slate-50 px-2 text-center font-semibold text-slate-950 outline-none transition focus:border-indigo-400 focus:bg-white focus:ring-2 focus:ring-indigo-100"
                               type="number"
                               min="1"
                               max={item.stock}
@@ -1167,7 +1210,7 @@ export default function POSPage() {
                             </button>
                           </div>
                         </div>
-                        <p className="text-right text-lg font-black text-indigo-600">
+                        <p className="text-right text-lg font-semibold text-indigo-600">
                           {currency.format(item.price * item.quantity)}
                         </p>
                       </div>
@@ -1177,11 +1220,11 @@ export default function POSPage() {
               </div>
             </div>
 
-            <div className="rounded-3xl border border-white bg-white p-5 shadow-xl">
+            <div className="rounded-xl border border-white bg-white p-5 shadow-sm">
               <div className="space-y-3 text-sm">
                 <div className="flex justify-between">
                   <span className="font-semibold text-slate-500">Subtotal</span>
-                  <span className="font-black">{currency.format(subtotal)}</span>
+                  <span className="font-semibold">{currency.format(subtotal)}</span>
                 </div>
                 <div className="flex items-center justify-between gap-3">
                   <span className="font-semibold text-slate-500">Discount</span>
@@ -1197,7 +1240,7 @@ export default function POSPage() {
                       }
                     />
                     <span className="font-bold text-slate-500">%</span>
-                    <span className="w-20 text-right font-black text-emerald-600">
+                    <span className="w-20 text-right font-semibold text-emerald-600">
                       -{currency.format(discountAmount)}
                     </span>
                   </div>
@@ -1214,47 +1257,47 @@ export default function POSPage() {
                       onChange={(event) => setTaxPercent(Math.min(100, Math.max(0, Number(event.target.value))))}
                     />
                     <span className="font-bold text-slate-500">%</span>
-                    <span className="w-20 text-right font-black">{currency.format(taxAmount)}</span>
+                    <span className="w-20 text-right font-semibold">{currency.format(taxAmount)}</span>
                   </div>
                 </div>
                 <div className="h-px bg-slate-100" />
                 <div className="flex items-center justify-between">
-                  <span className="text-lg font-black">Total</span>
-                  <span className="bg-gradient-to-r from-indigo-600 to-cyan-500 bg-clip-text text-3xl font-black text-transparent">
+                  <span className="text-lg font-semibold">Total</span>
+                  <span className="text-indigo-700 text-3xl font-semibold">
                     {currency.format(total)}
                   </span>
                 </div>
               </div>
             </div>
 
-            <div className="rounded-3xl border border-white bg-white p-5 shadow-xl">
-              <div className="mb-4 rounded-2xl bg-gradient-to-br from-indigo-50 to-cyan-50 p-4">
-                <p className="text-xs font-black uppercase tracking-wide text-indigo-500">Purchase flow</p>
+            <div className="rounded-xl border border-white bg-white p-5 shadow-sm">
+              <div className="mb-4 rounded-xl bg-slate-50 p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-indigo-500">Purchase flow</p>
                 <p className="mt-2 text-sm font-semibold text-slate-600">
                   Start a purchase, enter customer details, review the bill, then print the receipt.
                 </p>
                 {cart.length === 0 && (
-                  <p className="mt-3 rounded-xl bg-amber-100 px-3 py-2 text-xs font-black text-amber-800">
+                  <p className="mt-3 rounded-xl bg-amber-100 px-3 py-2 text-xs font-semibold text-amber-800">
                     Add a product to the cart first. The Purchase button will then open customer details.
                   </p>
                 )}
               </div>
               {lastInvoice && (
-                <div className="mb-4 rounded-2xl border border-indigo-100 bg-indigo-50 p-3 text-sm font-bold text-indigo-800">
+                <div className="mb-4 rounded-xl border border-indigo-100 bg-indigo-50 p-3 text-sm font-bold text-indigo-800">
                   Last invoice: {lastInvoice}
                 </div>
               )}
 
               {cart.length > 0 && (
-                <div className="mb-4 grid gap-3 rounded-2xl border border-slate-100 bg-slate-50 p-3">
-                  <p className="text-sm font-black text-slate-700">Payment</p>
-                  <div className="flex h-10 items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-3 text-sm font-black text-emerald-800">
+                <div className="mb-4 grid gap-3 rounded-xl border border-slate-100 bg-slate-50 p-3">
+                  <p className="text-sm font-semibold text-slate-700">Payment</p>
+                  <div className="flex h-10 items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-3 text-sm font-semibold text-emerald-800">
                     <span>Cash only</span>
                     <span>Payment history is still recorded as Cash</span>
                   </div>
                   <div className="grid grid-cols-[1fr_auto] gap-2">
                     <input
-                      className="h-11 rounded-xl border border-slate-200 bg-white px-3 text-lg font-black outline-none focus:border-emerald-400"
+                      className="h-11 rounded-xl border border-slate-200 bg-white px-3 text-lg font-semibold outline-none focus:border-emerald-400"
                       type="number"
                       min="0"
                       step="0.01"
@@ -1264,19 +1307,19 @@ export default function POSPage() {
                     />
                     <button
                       onClick={() => setAmountPaid(total.toFixed(2))}
-                      className="h-11 rounded-xl bg-emerald-100 px-3 text-sm font-black text-emerald-700"
+                      className="h-11 rounded-xl bg-emerald-100 px-3 text-sm font-semibold text-emerald-700"
                     >
                       Exact
                     </button>
                   </div>
-                  <div className={`flex justify-between rounded-xl px-3 py-2 text-sm font-black ${isDebtSale ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
+                  <div className={`flex justify-between rounded-xl px-3 py-2 text-sm font-semibold ${isDebtSale ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'}`}>
                     <span>{isDebtSale ? 'To be paid' : 'Change due'}</span>
                     <span>{currency.format(isDebtSale ? amountDue : changeDue)}</span>
                   </div>
                   {isDebtSale && (
-                    <div className="grid gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-3">
+                    <div className="grid gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3">
                       <div>
-                        <p className="text-sm font-black text-amber-900">Open customer account</p>
+                        <p className="text-sm font-semibold text-amber-900">Open customer account</p>
                         <p className="mt-1 text-xs font-bold text-amber-800">
                           Existing accounts are matched by Account ID or mobile number. New accounts receive a system ID automatically.
                         </p>
@@ -1308,7 +1351,7 @@ export default function POSPage() {
                     </div>
                   )}
                   <div className={`rounded-xl border p-3 text-xs font-bold ${missingBillItems.length === 0 ? 'border-emerald-200 bg-emerald-50 text-emerald-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
-                    <p className="mb-2 font-black">{missingBillItems.length === 0 ? 'Bill is ready to review.' : 'Missing before bill review:'}</p>
+                    <p className="mb-2 font-semibold">{missingBillItems.length === 0 ? 'Bill is ready to review.' : 'Missing before bill review:'}</p>
                     {missingBillItems.length === 0 ? (
                       <p>All required purchase details are complete.</p>
                     ) : (
@@ -1324,7 +1367,7 @@ export default function POSPage() {
 
               <div className="grid grid-cols-[auto_1fr] gap-2">
                 <button
-                  className="flex h-12 items-center justify-center gap-2 rounded-2xl border border-slate-200 px-4 font-black text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="flex h-12 items-center justify-center gap-2 rounded-xl border border-slate-200 px-4 font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
                   disabled={!receipt}
                   onClick={() => window.print()}
                 >
@@ -1332,7 +1375,7 @@ export default function POSPage() {
                   Receipt
                 </button>
                 <button
-                  className="flex h-12 items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-600 via-indigo-600 to-cyan-500 font-black text-white shadow-glow transition hover:opacity-95"
+                  className="flex h-12 items-center justify-center gap-2 rounded-xl bg-indigo-600 font-semibold text-white shadow-sm transition hover:opacity-95"
                   onClick={() => {
                     if (cart.length === 0) {
                       startPurchaseFlow()
@@ -1361,25 +1404,27 @@ export default function POSPage() {
         </div>
       </main>
 
+      {receipt && <div className="print-receipt"><BillView {...receipt} storeSettings={storeSettings} title="Sale receipt" /></div>}
+
       {purchaseStep !== 'closed' && (
-        <div className="no-print fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-6 backdrop-blur-sm">
-          <div className="max-h-[92vh] w-full max-w-3xl overflow-hidden rounded-3xl bg-white shadow-2xl">
+        <div role="dialog" aria-modal="true" aria-label="Purchase" className="no-print fixed inset-0 z-50 flex items-center justify-center bg-slate-950/70 p-6 backdrop-blur-sm">
+          <div className="max-h-[92vh] w-full max-w-3xl overflow-hidden rounded-xl bg-white shadow-sm">
             <div className="flex items-center justify-between border-b border-slate-100 p-5">
               <div>
-                <p className="text-xs font-black uppercase tracking-wide text-indigo-500">
+                <p className="text-xs font-semibold uppercase tracking-wide text-indigo-500">
                   {purchaseStep === 'customer' && 'Step 1 of 3'}
                   {purchaseStep === 'bill' && 'Step 2 of 3'}
                   {purchaseStep === 'receipt' && 'Receipt ready'}
                 </p>
-                <h2 className="mt-1 text-2xl font-black">
+                <h2 className="mt-1 text-2xl font-semibold">
                   {purchaseStep === 'customer' && 'Customer details'}
                   {purchaseStep === 'bill' && 'Bill preview'}
                   {purchaseStep === 'receipt' && 'Purchase receipt'}
                 </h2>
               </div>
               <button
-                onClick={() => setPurchaseStep('closed')}
-                className="rounded-xl border border-slate-200 px-3 py-2 font-black text-slate-600 hover:bg-slate-50"
+                disabled={isProcessing} onClick={() => setPurchaseStep('closed')}
+                className="rounded-xl border border-slate-200 px-3 py-2 font-semibold text-slate-600 hover:bg-slate-50"
               >
                 Close
               </button>
@@ -1388,14 +1433,14 @@ export default function POSPage() {
             <div data-scroll-region="modal" tabIndex={0} className="max-h-[calc(92vh-96px)] overflow-auto p-5 outline-none">
               {purchaseStep === 'customer' && (
                 <div className="grid gap-4">
-                  <div className="rounded-2xl bg-slate-50 p-4">
+                  <div className="rounded-xl bg-slate-50 p-4">
                     <p className="text-sm font-bold text-slate-500">Cart total</p>
-                    <p className="text-3xl font-black text-indigo-600">{currency.format(total)}</p>
+                    <p className="text-3xl font-semibold text-indigo-600">{currency.format(total)}</p>
                     <p className="mt-1 text-sm font-semibold text-slate-500">{cartCount} item(s) will be purchased.</p>
                   </div>
                   <div className="grid gap-2 text-sm font-bold text-slate-600">
                     Payment method
-                    <div className="flex h-11 items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 text-sm font-black text-emerald-800">
+                    <div className="flex h-11 items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 text-sm font-semibold text-emerald-800">
                       <span>Cash only</span>
                       <span>Recorded in payment history</span>
                     </div>
@@ -1404,7 +1449,7 @@ export default function POSPage() {
                     Amount received
                     <div className="grid grid-cols-[1fr_auto] gap-2">
                       <input
-                        className="h-12 rounded-xl border border-slate-200 px-4 text-xl font-black text-slate-950 outline-none focus:border-emerald-400"
+                        className="h-12 rounded-xl border border-slate-200 px-4 text-xl font-semibold text-slate-950 outline-none focus:border-emerald-400"
                         type="number"
                         min="0"
                         step="0.01"
@@ -1414,21 +1459,21 @@ export default function POSPage() {
                       />
                       <button
                         onClick={() => setAmountPaid(total.toFixed(2))}
-                        className="h-12 rounded-xl bg-emerald-100 px-4 font-black text-emerald-700"
+                        className="h-12 rounded-xl bg-emerald-100 px-4 font-semibold text-emerald-700"
                       >
                         Exact
                       </button>
                     </div>
                   </label>
-                  <div className={`flex items-center justify-between rounded-2xl border p-4 ${isDebtSale ? 'border-amber-100 bg-amber-50' : 'border-emerald-100 bg-emerald-50'}`}>
-                    <span className={`font-black ${isDebtSale ? 'text-amber-700' : 'text-emerald-700'}`}>{isDebtSale ? 'To be paid' : 'Change due'}</span>
-                    <span className={`text-2xl font-black ${isDebtSale ? 'text-amber-700' : 'text-emerald-700'}`}>
+                  <div className={`flex items-center justify-between rounded-xl border p-4 ${isDebtSale ? 'border-amber-100 bg-amber-50' : 'border-emerald-100 bg-emerald-50'}`}>
+                    <span className={`font-semibold ${isDebtSale ? 'text-amber-700' : 'text-emerald-700'}`}>{isDebtSale ? 'To be paid' : 'Change due'}</span>
+                    <span className={`text-2xl font-semibold ${isDebtSale ? 'text-amber-700' : 'text-emerald-700'}`}>
                       {currency.format(isDebtSale ? amountDue : changeDue)}
                     </span>
                   </div>
                   {isDebtSale && (
-                    <div className="grid gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4">
-                      <p className="text-sm font-black text-amber-900">Customer account details</p>
+                    <div className="grid gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
+                      <p className="text-sm font-semibold text-amber-900">Customer account details</p>
                       <input
                         className="h-11 rounded-xl border border-amber-200 bg-white px-4 text-base font-semibold uppercase text-slate-950 outline-none focus:border-indigo-400"
                         value={customerAccountNumber}
@@ -1467,7 +1512,7 @@ export default function POSPage() {
                       }
                       setPurchaseStep('bill')
                     }}
-                    className="h-12 rounded-2xl bg-gradient-to-r from-indigo-600 to-cyan-500 font-black text-white"
+                    className="h-12 rounded-xl bg-indigo-600 font-semibold text-white"
                   >
                     Review Bill
                   </button>
@@ -1501,14 +1546,14 @@ export default function POSPage() {
                   <div className="grid grid-cols-2 gap-3">
                     <button
                       onClick={() => setPurchaseStep('customer')}
-                      className="h-12 rounded-2xl border border-slate-200 font-black text-slate-700 hover:bg-slate-50"
+                      className="h-12 rounded-xl border border-slate-200 font-semibold text-slate-700 hover:bg-slate-50"
                     >
                       Back
                     </button>
                     <button
                       onClick={completeSale}
                       disabled={!canComplete}
-                      className="flex h-12 items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-indigo-600 to-cyan-500 font-black text-white disabled:opacity-40"
+                      className="flex h-12 items-center justify-center gap-2 rounded-xl bg-indigo-600 font-semibold text-white disabled:opacity-40"
                     >
                       {isProcessing && <span className="h-5 w-5 animate-spin rounded-full border-2 border-white/30 border-t-white" />}
                       {isProcessing ? 'Saving...' : isDebtSale ? 'Save Debt Sale' : 'Complete Purchase'}
@@ -1522,6 +1567,7 @@ export default function POSPage() {
                   <BillView
                     storeSettings={storeSettings}
                     title="Receipt"
+                    createdAt={receipt.createdAt}
                     invoiceNumber={receipt.invoiceNumber}
                     customerId={receipt.customerId}
                     customerAccountNumber={receipt.customerAccountNumber}
@@ -1543,14 +1589,14 @@ export default function POSPage() {
                   />
                   <div className="grid grid-cols-2 gap-3">
                     <button
-                      onClick={() => setPurchaseStep('closed')}
-                      className="h-12 rounded-2xl border border-slate-200 font-black text-slate-700 hover:bg-slate-50"
+                      disabled={isProcessing} onClick={() => setPurchaseStep('closed')}
+                      className="h-12 rounded-xl border border-slate-200 font-semibold text-slate-700 hover:bg-slate-50"
                     >
                       Done
                     </button>
                     <button
                       onClick={() => window.print()}
-                      className="flex h-12 items-center justify-center gap-2 rounded-2xl bg-slate-950 font-black text-white"
+                      className="flex h-12 items-center justify-center gap-2 rounded-xl bg-slate-950 font-semibold text-white"
                     >
                       <Printer className="h-5 w-5" />
                       Print Receipt
@@ -1568,6 +1614,7 @@ export default function POSPage() {
 
 function BillView({
   storeSettings,
+  createdAt,
   title,
   invoiceNumber,
   customerId,
@@ -1589,6 +1636,7 @@ function BillView({
   paymentStatus
 }: {
   storeSettings: StoreSettings
+  createdAt?: string
   title: string
   invoiceNumber: string
   customerId?: number
@@ -1612,11 +1660,11 @@ function BillView({
   const hasDebt = paymentStatus === 'Pending' && amountDue > 0
 
   return (
-    <div className="rounded-3xl border border-slate-200 bg-white p-5">
+    <div className="rounded-xl border border-slate-200 bg-white p-5">
       <div className="flex items-start justify-between border-b border-slate-100 pb-4">
         <div>
-          <p className="text-sm font-black uppercase tracking-wide text-indigo-500">{storeSettings.ShopName}</p>
-          <h3 className="mt-1 text-2xl font-black">{title}</h3>
+          <p className="text-sm font-semibold uppercase tracking-wide text-indigo-500">{storeSettings.ShopName}</p>
+          <h3 className="mt-1 text-2xl font-semibold">{title}</h3>
           {storeSettings.ReceiptHeaderMessage && (
             <p className="mt-1 text-sm font-semibold text-slate-600">{storeSettings.ReceiptHeaderMessage}</p>
           )}
@@ -1630,23 +1678,23 @@ function BillView({
           {storeSettings.ShopEmail && <p className="text-sm font-semibold text-slate-500">{storeSettings.ShopEmail}</p>}
         </div>
         <div className="text-right text-sm font-semibold text-slate-500">
-          <p>{new Date().toLocaleString()}</p>
+          <p>{new Date(createdAt || Date.now()).toLocaleString()}</p>
           <p>Cashier: {cashierName}</p>
         </div>
       </div>
 
       <div className="grid grid-cols-2 gap-3 py-4 text-sm">
-        <div className="rounded-2xl bg-slate-50 p-3">
+        <div className="rounded-xl bg-slate-50 p-3">
           <p className="font-bold text-slate-500">Customer</p>
-          <p className="font-black text-slate-950">{customerName}</p>
+          <p className="font-semibold text-slate-950">{customerName}</p>
           {customerAccountNumber && <p className="font-semibold text-indigo-600">Account {customerAccountNumber}</p>}
           {customerId && <p className="font-semibold text-indigo-600">ID #{customerId}</p>}
           {customerFatherName && <p className="font-semibold text-slate-500">Father: {customerFatherName}</p>}
           {customerPhone && <p className="font-semibold text-slate-500">{customerPhone}</p>}
         </div>
-        <div className="rounded-2xl bg-slate-50 p-3">
+        <div className="rounded-xl bg-slate-50 p-3">
           <p className="font-bold text-slate-500">Payment</p>
-          <p className="font-black text-slate-950">{hasDebt ? 'Debt sale' : 'Cash purchase'}</p>
+          <p className="font-semibold text-slate-950">{hasDebt ? 'Debt sale' : 'Cash purchase'}</p>
           <p className="font-semibold text-slate-500">Paid {currency.format(paid)}</p>
           {hasDebt && <p className="font-semibold text-amber-700">To be paid {currency.format(amountDue)}</p>}
         </div>
@@ -1667,27 +1715,27 @@ function BillView({
               <td className="px-3 py-3 font-bold">{item.name}</td>
               <td className="px-3 py-3 text-right font-semibold">{item.quantity}</td>
               <td className="px-3 py-3 text-right font-semibold">{currency.format(item.price)}</td>
-              <td className="px-3 py-3 text-right font-black">{currency.format(item.price * item.quantity)}</td>
+              <td className="px-3 py-3 text-right font-semibold">{currency.format(item.price * item.quantity)}</td>
             </tr>
           ))}
         </tbody>
       </table>
 
       <div className="ml-auto mt-4 grid max-w-sm gap-2 text-sm">
-        <div className="flex justify-between"><span className="font-semibold text-slate-500">Subtotal</span><span className="font-black">{currency.format(subtotal)}</span></div>
-        <div className="flex justify-between"><span className="font-semibold text-slate-500">Discount ({discountPercent}%)</span><span className="font-black text-emerald-700">-{currency.format(discountAmount)}</span></div>
-        <div className="flex justify-between"><span className="font-semibold text-slate-500">Tax ({taxPercent}%)</span><span className="font-black">{currency.format(taxAmount)}</span></div>
+        <div className="flex justify-between"><span className="font-semibold text-slate-500">Subtotal</span><span className="font-semibold">{currency.format(subtotal)}</span></div>
+        <div className="flex justify-between"><span className="font-semibold text-slate-500">Discount ({discountPercent}%)</span><span className="font-semibold text-emerald-700">-{currency.format(discountAmount)}</span></div>
+        <div className="flex justify-between"><span className="font-semibold text-slate-500">Tax ({taxPercent}%)</span><span className="font-semibold">{currency.format(taxAmount)}</span></div>
         <div className="h-px bg-slate-100" />
-        <div className="flex justify-between text-lg"><span className="font-black">Total</span><span className="font-black text-indigo-600">{currency.format(total)}</span></div>
-        <div className="flex justify-between"><span className="font-semibold text-slate-500">Paid</span><span className="font-black">{currency.format(paid)}</span></div>
+        <div className="flex justify-between text-lg"><span className="font-semibold">Total</span><span className="font-semibold text-indigo-600">{currency.format(total)}</span></div>
+        <div className="flex justify-between"><span className="font-semibold text-slate-500">Paid</span><span className="font-semibold">{currency.format(paid)}</span></div>
         {hasDebt ? (
-          <div className="flex justify-between"><span className="font-semibold text-slate-500">To be paid</span><span className="font-black text-amber-700">{currency.format(amountDue)}</span></div>
+          <div className="flex justify-between"><span className="font-semibold text-slate-500">To be paid</span><span className="font-semibold text-amber-700">{currency.format(amountDue)}</span></div>
         ) : (
-          <div className="flex justify-between"><span className="font-semibold text-slate-500">Change</span><span className="font-black text-emerald-700">{currency.format(changeDue)}</span></div>
+          <div className="flex justify-between"><span className="font-semibold text-slate-500">Change</span><span className="font-semibold text-emerald-700">{currency.format(changeDue)}</span></div>
         )}
       </div>
       {storeSettings.ReceiptFooterMessage && (
-        <p className="mt-5 rounded-2xl bg-slate-50 p-3 text-center text-sm font-bold text-slate-600">
+        <p className="mt-5 rounded-xl bg-slate-50 p-3 text-center text-sm font-bold text-slate-600">
           {storeSettings.ReceiptFooterMessage}
         </p>
       )}

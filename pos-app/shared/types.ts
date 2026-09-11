@@ -360,6 +360,7 @@ export interface DiscountReport {
 
 // ── IPC Channel names (type-safe contract) ───────────────────────────────────
 export const IPC = {
+  AUTH_SESSION_STATUS: 'auth:session-status',
   AUTH_SETUP_STATUS: 'auth:setupStatus',
   AUTH_CREATE_INITIAL_ADMIN: 'auth:createInitialAdmin',
   AUTH_LOGIN: 'auth:login',
@@ -382,6 +383,7 @@ export const IPC = {
   SALES_GET_RANGE: 'sales:getRange',
   SALES_VOID: 'sales:void',
 
+  DEBTS_RECORD_PAYMENT: 'debts:record-payment',
   DEBTS_GET_ALL: 'debts:getAll',
 
   STOCK_GET_PRODUCTS: 'stock:getProducts',

@@ -15,6 +15,7 @@ export {}
 declare global {
   interface Window {
     api?: {
+      getSessionStatus?: () => Promise<any>
       getSetupStatus?: () => Promise<{ success: boolean; message: string; data: { setupRequired: boolean } }>
       createInitialAdmin?: (req: InitialAdminRequest) => Promise<any>
       login?: (req: LoginRequest) => Promise<LoginResponse>
@@ -36,6 +37,7 @@ declare global {
       getSaleByInvoice?: (invoice: string) => Promise<any>
       getSalesRange?: (start: string, end: string) => Promise<any>
       voidSale?: (saleId: number, userId: number, reason: string) => Promise<any>
+      recordDebtPayment?: (customerId: number, amount: number) => Promise<any>
       getCustomerDebts?: () => Promise<any>
 
       getStockProducts?: () => Promise<any>
